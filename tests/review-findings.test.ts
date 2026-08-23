@@ -719,6 +719,50 @@ describe("explicit compat precedence", () => {
     );
   });
 
+  test("duplicate custom model ids follow Pi's last-definition-wins behavior", () => {
+    const runtimeModel = {
+      provider,
+      id: modelId,
+      compat: {},
+    } as any;
+    const input = {
+      providers: {
+        [provider]: {
+          models: [
+            {
+              id: modelId,
+              api: "openai-responses",
+              baseUrl: "https://first.example/v1",
+              compat: { sendSessionAffinityHeaders: false },
+            },
+            {
+              id: modelId,
+              api: "openai-completions",
+              baseUrl: "https://last.example/v1",
+              compat: { sendSessionAffinityHeaders: true },
+            },
+          ],
+        },
+      },
+    };
+
+    assert.equal(
+      internals.resolveEffectiveCompatFromConfig(runtimeModel, input).sendSessionAffinityHeaders,
+      true,
+    );
+    assert.deepEqual(
+      internals.resolveExplicitCompatValue(input, provider, modelId, "sendSessionAffinityHeaders"),
+      { source: "model", value: true },
+    );
+    assert.deepEqual(
+      internals.applyConfiguredTransportToModel(
+        { ...runtimeModel, api: "", baseUrl: "" },
+        input,
+      ),
+      { ...runtimeModel, api: "openai-completions", baseUrl: "https://last.example/v1" },
+    );
+  });
+
   test("malformed models.json falls back to runtime model compat", () => {
     const runtimeModel = {
       provider,

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, copyFile, lstat, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
-import { constants as fsConstants, readFileSync, watch } from "node:fs";
+import { constants as fsConstants, readFileSync, statSync, watch } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -1057,9 +1057,10 @@ function isRoutedFallbackModel(model: PiModel | undefined): boolean {
 function applyConfiguredTransportToModel(model: PiModel, config: unknown): PiModel {
   const providers = asRecord(asRecord(config)?.providers);
   const provider = asRecord(providers?.[model.provider]);
-  const customModel = Array.isArray(provider?.models)
-    ? asRecord(provider.models.find((entry: unknown) => asRecord(entry)?.id === model.id))
-    : undefined;
+  const customModel = findLastExactModelDefinition(
+    Array.isArray(provider?.models) ? provider.models : undefined,
+    model.id,
+  );
   const configuredApi = customModel?.api ?? provider?.api;
   const configuredBaseUrl = customModel?.baseUrl ?? provider?.baseUrl;
   const api = isNonEmptyString(model.api)
@@ -1172,6 +1173,21 @@ const NESTED_COMPAT_KEYS = [
   "chatTemplateArgs",
 ] as const;
 
+function findLastExactModelDefinition(
+  models: unknown[] | undefined,
+  modelId: string,
+): UnknownRecord | undefined {
+  if (!models) return undefined;
+  // Pi's provider composer processes definitions in array order. If a malformed
+  // or hand-edited config repeats an id, the last definition replaces earlier
+  // definitions, so effective resolution must use the same deterministic rule.
+  for (let index = models.length - 1; index >= 0; index--) {
+    const candidate = asRecord(models[index]);
+    if (candidate?.id === modelId) return candidate;
+  }
+  return undefined;
+}
+
 function mergeCacheCompat(...sources: Array<UnknownRecord | undefined>): CacheCompat {
   const merged: CacheCompat = {};
   for (const source of sources) {
@@ -1196,9 +1212,10 @@ function getEffectiveCompatSources(model: PiModel, config: unknown): Array<{ sou
   const providers = asRecord(root?.providers);
   const provider = asRecord(providers?.[model.provider]);
   const providerCompat = asRecord(provider?.compat);
-  const customModel = Array.isArray(provider?.models)
-    ? provider.models.find((entry: unknown) => asRecord(entry)?.id === model.id)
-    : undefined;
+  const customModel = findLastExactModelDefinition(
+    Array.isArray(provider?.models) ? provider.models : undefined,
+    model.id,
+  );
   const customModelCompat = asRecord(asRecord(customModel)?.compat);
   const runtimeCompat = asRecord(model.compat);
   const modelOverride = asRecord(asRecord(provider?.modelOverrides)?.[model.id]);
@@ -1357,6 +1374,10 @@ function isValidCompatRecord(value: unknown): boolean {
   );
 }
 
+// Credential-blind fail-closed subset of Pi's models.json validation. This
+// intentionally covers only fields consumed by compat diagnostics, transport
+// recovery, and exact route fallback; it is not a replacement for Pi's full
+// schema and must stay conservative when the file is malformed.
 function isValidModelsConfigForEffectiveCompat(value: unknown): boolean {
   const root = asRecord(value);
   const providers = asRecord(root?.providers);
@@ -1376,13 +1397,42 @@ function isValidModelsConfigForEffectiveCompat(value: unknown): boolean {
   return true;
 }
 
-function readEffectiveCompatConfig(): unknown | undefined {
+type ModelsConfigCache = {
+  signature: string;
+  value: unknown | undefined;
+};
+
+let modelsConfigCache: ModelsConfigCache | undefined;
+
+function invalidateModelsConfigCache(): void {
+  modelsConfigCache = undefined;
+}
+
+function getModelsConfigSignature(): string {
   try {
-    const parsed = parseJsonc(readFileSync(MODELS_JSON_PATH, "utf8"));
-    return isValidModelsConfigForEffectiveCompat(parsed) ? parsed : undefined;
+    const info = statSync(MODELS_JSON_PATH);
+    return `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
   } catch {
-    return undefined;
+    return "missing";
   }
+}
+
+function readEffectiveCompatConfig(): unknown | undefined {
+  const signature = getModelsConfigSignature();
+  if (modelsConfigCache?.signature === signature) return modelsConfigCache.value;
+
+  let value: unknown | undefined;
+  if (signature !== "missing") {
+    try {
+      const parsed = parseJsonc(readFileSync(MODELS_JSON_PATH, "utf8"));
+      value = isValidModelsConfigForEffectiveCompat(parsed) ? parsed : undefined;
+    } catch {
+      value = undefined;
+    }
+  }
+
+  modelsConfigCache = { signature, value };
+  return value;
 }
 
 function getCompat(model: PiModel | undefined): CacheCompat {
@@ -6083,12 +6133,13 @@ function resolveExplicitCompatValue(
     return { source: "modelOverride", value: overrideCompat[compatKey] };
   }
 
-  if (Array.isArray(provider.models)) {
-    const model = provider.models.find((entry: unknown) => asRecord(entry)?.id === modelId);
-    const modelCompat = asRecord(asRecord(model)?.compat);
-    if (modelCompat && Object.prototype.hasOwnProperty.call(modelCompat, compatKey)) {
-      return { source: "model", value: modelCompat[compatKey] };
-    }
+  const model = findLastExactModelDefinition(
+    Array.isArray(provider.models) ? provider.models : undefined,
+    modelId,
+  );
+  const modelCompat = asRecord(model?.compat);
+  if (modelCompat && Object.prototype.hasOwnProperty.call(modelCompat, compatKey)) {
+    return { source: "model", value: modelCompat[compatKey] };
   }
 
   const providerCompat = asRecord(provider.compat);
@@ -6332,9 +6383,14 @@ function locateModelInJsonc(
       allModelIds.push(elementId);
     }
 
-    if (elementId === modelId && modelBrace < 0) {
+    if (elementId === modelId) {
+      // Match Pi's provider composer: later duplicate definitions replace
+      // earlier ones. The effective/fix target is therefore the last exact id.
       modelBrace = elementBrace;
       modelEndBrace = elementEnd;
+      compatKeyStartClean = -1;
+      compatBrace = -1;
+      compatEndBrace = -1;
 
       const compatKey = findJsonObjectKey(clean, modelBrace, "compat");
       if (compatKey && compatKey.keyStart < modelEndBrace) {
@@ -7606,6 +7662,7 @@ export const __internals_for_tests = {
   mergeCacheCompat,
   resolveEffectiveCompatFromConfig,
   getEffectiveCompatValueSource,
+  findLastExactModelDefinition,
   isValidModelsConfigForEffectiveCompat,
   addEffectiveSessionAffinityHeaders,
   getCompat,
@@ -9081,6 +9138,20 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
+        const duplicateTargetDefinitions = location.allModelIds.filter(
+          (configuredModelId) => configuredModelId === suggestion.modelId,
+        ).length;
+        if (duplicateTargetDefinitions > 1) {
+          cmdCtx.ui.notify(
+            `❌ ${getModelsJsonDisplayPath()} contains ${duplicateTargetDefinitions} custom model definitions ` +
+            `with the exact id "${suggestion.modelId}" under providers["${suggestion.providerLabel}"].\n` +
+            `Pi uses the last definition, but /cache-optimizer fix refuses an ambiguous duplicate-id edit. ` +
+            `Remove or consolidate the duplicates, then run the command again.`,
+            "error",
+          );
+          return;
+        }
+
         // Compose the modified text — observed runtime failures are always
         // model-scoped; ordinary compat fixes use the safety-based placement.
         const decision = chooseFixPlacement(
@@ -9179,6 +9250,7 @@ export default function (pi: ExtensionAPI) {
             return;
           }
 
+          invalidateModelsConfigCache();
           cmdCtx.ui.notify(
             `✅ Fix applied to ${getModelsJsonDisplayPath()}.\n` +
             `Backup saved to: ${backupPath}\n` +
