@@ -7,7 +7,7 @@ Resolve GitHub Issue #9 without special-casing Opencode-Go: when a Pi extension 
 ## Confirmed root cause
 
 * Pi's normal built-in/custom model path merges provider compat into the runtime model.
-* Pi 0.84.2 `registerProvider()` + extension-owned `models` can replace the model object after the lower config layer, so provider/model compat may be absent from `ctx.model.compat`.
+* Pi 0.84.3 `registerProvider()` + extension-owned `models` can replace the model object after the lower config layer, so provider/model compat may be absent from `ctx.model.compat`.
 * Pi Cache Optimizer's current `getCompat()` trusts only `model.compat`, despite comments saying it checks both levels.
 * Pi's OpenAI completions transport also reads the final model compat, so merely suppressing the warning could claim success while affinity headers remain absent.
 
@@ -31,18 +31,18 @@ Resolve GitHub Issue #9 without special-casing Opencode-Go: when a Pi extension 
 * Matching custom-model false overrides provider true; runtime-model true can override lower false; modelOverride false/true remains highest precedence.
 * Existing headers are preserved case-insensitively.
 * OpenRouter format, official OpenAI, openai-responses, custom API, disabled runtime, missing session id, and malformed config are covered.
-* An integration regression uses installed Pi 0.84.2 `ModelRuntime.registerProvider()` to prove provider compat is absent from the runtime model and that the extension bridge still honors it.
+* An integration regression uses installed Pi 0.84.3 `ModelRuntime.registerProvider()` to prove provider compat is absent from the runtime model and that the extension bridge still honors it.
 * `npm run typecheck`, `npm test`, `npm run check:diff`, `npm run check:pack`, and task context validation pass.
 
 ## Acceptance status
 
 * [x] Effective exact provider/model compat precedence and explicit false behavior are implemented.
 * [x] Diagnostics and request-header bridge share the effective compat resolver.
-* [x] Pi 0.84.2 extension-provider regression and request-header behavior have permanent tests.
+* [x] Pi 0.84.3 extension-provider regression and request-header behavior have permanent tests.
 * [x] README/spec/privacy documentation is synchronized.
 * [x] All required quality checks pass.
 * [x] Review follow-ups reject schema-invalid config, preserve Pi nested compat merges, and prevent virtual-router compat inheritance across identities.
-* [x] Validator edge cases are checked against installed Pi 0.84.2, routed registry misses recover validated upstream transport metadata without treating official OpenAI as a proxy, and unknown routed endpoints fail closed for both header injection and compat diagnostics, including DeepSeek-specific checks.
+* [x] Validator edge cases are checked against installed Pi 0.84.3, routed registry misses recover validated upstream transport metadata without treating official OpenAI as a proxy, and unknown routed endpoints fail closed for both header injection and compat diagnostics, including DeepSeek-specific checks.
 
 ## Documentation
 

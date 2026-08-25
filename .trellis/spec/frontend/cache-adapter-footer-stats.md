@@ -256,7 +256,7 @@ has no `sendSessionAffinityHeaders` value (`undefined`). Effective compat uses e
 provider/model ids and precedence `models.json provider.compat → matching
 models[].compat → runtime model.compat → modelOverrides[modelId].compat`. The runtime
 model layer is included because extension providers using `registerProvider()` may
-replace their model list after lower configuration was composed; Pi 0.84.2 can
+replace their model list after lower configuration was composed; Pi 0.84.x can
 therefore expose a model object without provider/custom-model compat even though the
 user configured it. Malformed/missing/unreadable or Pi-schema-invalid config falls
 back to runtime model compat without blocking hooks. Pi's untouched built-in
@@ -1053,7 +1053,7 @@ The extension registers a Pi command `/cache-optimizer` with runtime, diagnostic
 configuration, repair, and reset subcommands. It MUST register Pi's native
 `getArgumentCompletions(argumentPrefix)` callback rather than a custom editor or
 autocomplete provider. TypeScript validation consumes the installed official Pi
-0.84.2 declarations directly; a complete local ambient redeclaration is forbidden
+0.84.3 declarations directly; a complete local ambient redeclaration is forbidden
 because it can hide upstream API drift. Pi 0.84's expanded event/context surface
 is compatible with the subset used here. The callback completes the supported top-level
 subcommands (`enable`, `disable`, `doctor`, `stats`, `config`, `compat`, `reset`,
