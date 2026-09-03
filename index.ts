@@ -80,6 +80,8 @@ const STARTUP_CACHE_RETENTION_ENV = getOrCaptureCacheRetentionBaseline();
  * 2. Sets PI_CACHE_RETENTION=long at extension load time.
  * 3. Warns once for provider/model cache compat gaps where the signal is conservative.
  * 4. Shows lightweight persisted provider-specific cache stats in Pi's footer.
+ * 5. Offers disabled-by-default deterministic built-in tool ordering when
+ *    explicitly opted in.
  *
  * Provider prompt/KV caches are provider-side and best-effort. This extension improves
  * the odds of cache hits; it cannot guarantee hits, especially through proxies.
@@ -122,6 +124,7 @@ const NO_OPENAI_CACHE_KEY_ENV = "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY";
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 const NO_SKILL_COMPRESSION_ENV = "PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION";
 const NO_PROMPT_REWRITE_ENV = "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
+const TOOL_ORDER_ENV = "PI_CACHE_OPTIMIZER_TOOL_ORDER";
 const FOOTER_MODE_ENV = "PI_CACHE_OPTIMIZER_FOOTER_MODE";
 type FooterStatsMode = "session" | "total" | "process";
 type FooterStatsModeSource = "config" | "env" | "default";
@@ -391,6 +394,15 @@ type OptimizedSystemPrompt = {
   changed: boolean;
 };
 
+type ToolOrderApi =
+  | "openai-completions"
+  | "openai-responses"
+  | "anthropic-messages"
+  | "google-generative-ai"
+  | "google-vertex"
+  | "bedrock-converse-stream";
+
+
 /**
  * Per-request sample stored for trend analysis and usage-field-missing detection.
  * Contains only numeric counters and booleans — never message content, prompts,
@@ -479,6 +491,205 @@ function isStableContextFilePath(filePath: string): boolean {
     normalized.startsWith(".trellis/spec/") ||
     normalized.includes("/.trellis/spec/")
   );
+}
+
+function isKnownToolOrderApi(api: unknown): api is ToolOrderApi {
+  return api === "openai-completions" || api === "openai-responses" ||
+    api === "anthropic-messages" || api === "google-generative-ai" ||
+    api === "google-vertex" || api === "bedrock-converse-stream";
+}
+
+function isToolOrderingEligibleModel(model: PiModel | undefined): boolean {
+  // Responses/Codex prompt bypasses remain untouched. The pure helper still
+  // supports the verified Responses shape for fixture use, but the request
+  // hook must preserve Pi's server-managed/safety-sensitive bypass.
+  return !!model && isKnownToolOrderApi(model.api) && !isResponsesPromptRewriteBypassApi(model.api);
+}
+
+function getToolNameForPayload(tool: unknown): string | undefined {
+  const record = asRecord(tool);
+  if (!record) return undefined;
+  if (isNonEmptyString(record.name)) return record.name;
+  const fn = asRecord(record.function);
+  if (isNonEmptyString(fn?.name)) return fn.name;
+  const custom = asRecord(record.custom);
+  if (isNonEmptyString(custom?.name)) return custom.name;
+  const spec = asRecord(record.toolSpec);
+  if (isNonEmptyString(spec?.name)) return spec.name;
+  return undefined;
+}
+
+function compareToolOrderEntries(
+  left: { name: string; index: number },
+  right: { name: string; index: number },
+): number {
+  // Do not use localeCompare here: its result can vary with the host locale.
+  // Exact UTF-16 code-unit ordering plus the original index is reproducible.
+  return left.name < right.name ? -1 : left.name > right.name ? 1 : left.index - right.index;
+}
+
+function isJsonObject(value: unknown): value is UnknownRecord {
+  return asRecord(value) !== undefined;
+}
+
+function isVerifiedToolForApi(tool: unknown, api: ToolOrderApi): tool is UnknownRecord {
+  const record = asRecord(tool);
+  if (!record) return false;
+
+  if (api === "openai-completions") {
+    if (record.type === "function") {
+      const fn = asRecord(record.function);
+      return isNonEmptyString(fn?.name) && isJsonObject(fn.parameters);
+    }
+    if (record.type === "custom") {
+      const custom = asRecord(record.custom);
+      return isNonEmptyString(custom?.name) && isJsonObject(custom.format);
+    }
+    return false;
+  }
+
+  if (api === "openai-responses") {
+    if (record.type === "function") {
+      return isNonEmptyString(record.name) && isJsonObject(record.parameters);
+    }
+    if (record.type === "custom") {
+      return isNonEmptyString(record.name) && isJsonObject(record.format);
+    }
+    return false;
+  }
+
+  if (api === "anthropic-messages") {
+    return isNonEmptyString(record.name) && isJsonObject(record.input_schema);
+  }
+
+  if (api === "google-generative-ai" || api === "google-vertex") {
+    return isNonEmptyString(record.name) &&
+      (isJsonObject(record.parametersJsonSchema) || isJsonObject(record.parameters));
+  }
+
+  const spec = asRecord(record.toolSpec);
+  const inputSchema = asRecord(spec?.inputSchema);
+  return isNonEmptyString(spec?.name) && isJsonObject(inputSchema?.json);
+}
+
+type ToolArrayInspection = {
+  sortedIndices: number[];
+  changed: boolean;
+};
+
+function hasTopLevelCacheControl(tools: unknown): boolean {
+  return Array.isArray(tools) && tools.some((tool) => {
+    const record = asRecord(tool);
+    return !!record && Object.prototype.hasOwnProperty.call(record, "cache_control");
+  });
+}
+
+function inspectToolArray(tools: unknown, api: ToolOrderApi): ToolArrayInspection | undefined {
+  if (!Array.isArray(tools)) return undefined;
+  // Native Anthropic and OpenAI-compatible transports can attach a cache
+  // breakpoint to a specific tool (normally the final one). Never move it,
+  // regardless of API id. Anthropic defer_loading also encodes immediate vs
+  // deferred tool groups in array order, so mixed/grouped payloads are no-ops.
+  if (hasTopLevelCacheControl(tools)) return undefined;
+  if (api === "anthropic-messages" && tools.some((tool) => {
+    const record = asRecord(tool);
+    return !!record && Object.prototype.hasOwnProperty.call(record, "defer_loading");
+  })) return undefined;
+  const entries = tools.map((tool, index) => {
+    if (!isVerifiedToolForApi(tool, api)) return undefined;
+    return { name: getToolNameForPayload(tool) ?? "", index };
+  });
+  if (entries.some((entry) => entry === undefined)) return undefined;
+
+  const verified = entries as Array<{ name: string; index: number }>;
+  const sorted = [...verified].sort(compareToolOrderEntries);
+  return {
+    sortedIndices: sorted.map((entry) => entry.index),
+    changed: sorted.some((entry, index) => entry.index !== index),
+  };
+}
+
+type ToolArrayPath = {
+  kind: "root" | "bedrock" | "google";
+  groupIndex?: number;
+  sortedIndices: number[];
+};
+
+/**
+ * Pure deterministic tool-order normalizer for the exact payload shapes
+ * emitted by Pi's built-in transports. It returns the original object for a
+ * no-op/unsupported/malformed payload and shallow-clones only the verified
+ * path to a tool array when sorting is needed. Tool objects and unrelated
+ * request fields (including SDK objects and AbortSignal) retain their identity.
+ */
+function normalizeToolsInPayload(
+  payload: unknown,
+  api: unknown,
+): { payload: unknown; changed: boolean } {
+  if (!isKnownToolOrderApi(api)) return { payload, changed: false };
+  const root = asRecord(payload);
+  if (!root) return { payload, changed: false };
+
+  if (api === "google-generative-ai" || api === "google-vertex") {
+    const config = asRecord(root.config);
+    const groups = config?.tools;
+    if (!Array.isArray(groups) || groups.length === 0) return { payload, changed: false };
+
+    const paths: ToolArrayPath[] = [];
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+      const group = asRecord(groups[groupIndex]);
+      if (!group || !Array.isArray(group.functionDeclarations)) return { payload, changed: false };
+      const inspected = inspectToolArray(group.functionDeclarations, api);
+      if (!inspected) return { payload, changed: false };
+      if (inspected.changed) paths.push({ kind: "google", groupIndex, sortedIndices: inspected.sortedIndices });
+    }
+    if (paths.length === 0) return { payload, changed: false };
+
+    const sortedGroups = [...groups];
+    for (const path of paths) {
+      const groupIndex = path.groupIndex!;
+      const group = asRecord(groups[groupIndex])!;
+      const tools = group.functionDeclarations as unknown[];
+      sortedGroups[groupIndex] = {
+        ...group,
+        functionDeclarations: path.sortedIndices.map((index) => tools[index]),
+      };
+    }
+    return {
+      payload: { ...root, config: { ...config, tools: sortedGroups } },
+      changed: true,
+    };
+  }
+
+  if (api === "bedrock-converse-stream") {
+    const toolConfig = asRecord(root.toolConfig);
+    const tools = toolConfig?.tools;
+    const inspected = inspectToolArray(tools, api);
+    if (!inspected || !inspected.changed || !Array.isArray(tools)) return { payload, changed: false };
+    return {
+      payload: {
+        ...root,
+        toolConfig: {
+          ...toolConfig,
+          tools: inspected.sortedIndices.map((index) => tools[index]),
+        },
+      },
+      changed: true,
+    };
+  }
+
+  const tools = root.tools;
+  const inspected = inspectToolArray(tools, api);
+  if (!inspected || !inspected.changed || !Array.isArray(tools)) return { payload, changed: false };
+  return {
+    payload: { ...root, tools: inspected.sortedIndices.map((index) => tools[index]) },
+    changed: true,
+  };
+}
+
+/** Public test-facing alias: a pure payload transformation. */
+function sortToolsInPayload(payload: unknown, api: unknown): unknown {
+  return normalizeToolsInPayload(payload, api).payload;
 }
 
 function formatSkillsForPrompt(skills: NonNullable<BuildSystemPromptOptions["skills"]>): string {
@@ -1549,6 +1760,10 @@ function isEnabledEnv(value: string | undefined): boolean {
   return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
+function isToolOrderEnabled(env: MutableEnv = process.env): boolean {
+  return runtimeOptimizerEnabled && isEnabledEnv(env[TOOL_ORDER_ENV]);
+}
+
 function parseFooterStatsMode(value: unknown): FooterStatsMode | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim().toLowerCase();
@@ -1722,6 +1937,7 @@ function getOptimizerRuntimeModeLines(): string[] {
   const lines: string[] = [];
   lines.push(`Runtime state: ${state}`);
   lines.push(`• Prompt rewrite: ${runtimeOptimizerEnabled && !isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV]) ? "on" : "off"}`);
+  lines.push(`• Deterministic tool ordering: ${isToolOrderEnabled() ? "on (verified built-in payloads, opt-in)" : "off"}`);
   lines.push(`• OpenAI prompt_cache_key fallback: ${shouldInjectOpenAIPromptCacheKey() ? "on" : "off"}`);
   lines.push(`• Footer cache stats: on${runtimeOptimizerEnabled ? "" : " (comparison mode)"}`);
   lines.push(`• Compat warnings: ${runtimeOptimizerEnabled ? "on" : "off"}`);
@@ -7666,6 +7882,12 @@ export const __internals_for_tests = {
   isValidModelsConfigForEffectiveCompat,
   addEffectiveSessionAffinityHeaders,
   getCompat,
+  isKnownToolOrderApi,
+  getToolNameForPayload,
+  compareToolOrderEntries,
+  isVerifiedToolForApi,
+  normalizeToolsInPayload,
+  sortToolsInPayload,
   modelKey,
   modelFromAssistantMessage,
   consolidateDirectProviderStatsModel,
@@ -7683,6 +7905,8 @@ export const __internals_for_tests = {
   formatOptimizerRuntimeMode,
   PI_CACHE_RETENTION_ENV,
   LONG_CACHE_RETENTION_VALUE,
+  TOOL_ORDER_ENV,
+  isToolOrderEnabled,
   // Integrity diagnostics
   getLastPromptIntegrityWarningAt,
   // Diagnostic command helpers
@@ -8440,9 +8664,7 @@ export default function (pi: ExtensionAPI) {
     // prompt mutations below (session-overview churn strip, skill compression,
     // and stable-prefix reordering). Footer stats and the OpenAI
     // prompt_cache_key fallback remain active.
-    if (isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV])) {
-      return {};
-    }
+    if (isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV])) return {};
 
     // Step 1: strip per-turn churn from <session-overview>.
     // Removing RECENT COMMITS, Working directory status, and
@@ -8523,6 +8745,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_provider_request", (event, ctx) => {
     const requestModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+    let requestPayload: unknown = event.payload;
+    let toolOrderChanged = false;
+
+    if (isToolOrderEnabled() && isToolOrderingEligibleModel(requestModel)) {
+      const normalized = normalizeToolsInPayload(requestPayload, requestModel.api);
+      requestPayload = normalized.payload;
+      toolOrderChanged = normalized.changed;
+    }
 
     // Anthropic rejects mixed cache breakpoints when a 1h block appears after
     // a 5m/default block in wire order (tools → system → messages). Repair any
@@ -8530,9 +8760,9 @@ export default function (pi: ExtensionAPI) {
     // hidden short breakpoints after this hook; only models that have actually
     // returned the explicit TTL-order error receive the process-local 5m fallback.
     if (requestModel && isAnthropicMessagesApi(requestModel.api)) {
-      const visibleConflictFixed = normalizeAnthropicCacheControlTtlOrder(event.payload);
+      const visibleConflictFixed = normalizeAnthropicCacheControlTtlOrder(requestPayload);
       if (!visibleConflictFixed && anthropicTtlOrderErrorModels.has(modelKey(requestModel))) {
-        downgradeAnthropicLongCacheControls(event.payload);
+        downgradeAnthropicLongCacheControls(requestPayload);
       }
     }
 
@@ -8550,28 +8780,30 @@ export default function (pi: ExtensionAPI) {
     // Gate 2 before Gate 3 is critical: if a user explicitly opted in but
     // the API returned 400, we must strip — otherwise the 400 repeats forever.
     if (runtimeOptimizerEnabled) {
-      const payload = event.payload as UnknownRecord;
-      if (payload && typeof payload.prompt_cache_retention === 'string') {
+      const payloadRecord = asRecord(requestPayload);
+      if (payloadRecord && typeof payloadRecord.prompt_cache_retention === "string") {
         if (requestModel) {
           if (isOfficialOpenAIBaseUrl(requestModel)) {
             // Gate 1: Official OpenAI → keep
           } else if (promptCacheRetention400Models.has(modelKey(requestModel))) {
             // Gate 2: 400 history → strip (overrides user opt-in)
-            delete payload.prompt_cache_retention;
+            delete payloadRecord.prompt_cache_retention;
           } else if (hasExplicitLongRetentionOptIn(requestModel)) {
             // Gate 3: Explicit user opt-in → keep
           } else {
             // Gate 4: Safe default → strip
-            delete payload.prompt_cache_retention;
+            delete payloadRecord.prompt_cache_retention;
           }
         }
       }
     }
 
-    if (!shouldInjectOpenAIPromptCacheKey()) return undefined;
-    if (!shouldInjectOpenAIPromptCacheKeyForModel(requestModel)) return undefined;
+    if (!shouldInjectOpenAIPromptCacheKey() || !shouldInjectOpenAIPromptCacheKeyForModel(requestModel)) {
+      return toolOrderChanged ? requestPayload : undefined;
+    }
 
-    return addOpenAIPromptCacheKey(event.payload, getSessionPromptCacheKey(ctx));
+    const withCacheKey = addOpenAIPromptCacheKey(requestPayload, getSessionPromptCacheKey(ctx));
+    return withCacheKey ?? (toolOrderChanged ? requestPayload : undefined);
   });
 
   pi.on("after_provider_response", (event, ctx) => {

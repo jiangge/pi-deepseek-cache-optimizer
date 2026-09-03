@@ -948,6 +948,14 @@ No opt-out; the stripped fields carry zero task-execution information
 that the model cannot obtain from `git log` / `git status` / `wc -l`
 in the rare case it actually needs them.
 
+## Opt-in deterministic tool ordering
+
+`PI_CACHE_OPTIMIZER_TOOL_ORDER` enables a pure immutable normalizer for verified Pi built-in OpenAI Completions, Anthropic, Google, and Bedrock payload shapes. It is off by default, requires an explicit truthy value (`1`, `true`, `yes`, or `on`, case-insensitive), and is suppressed by runtime disable. Google/Vertex tools are read from Pi's real `payload.config.tools[].functionDeclarations` path. The helper also recognizes the OpenAI Responses shape for fixture verification, but the request hook preserves the existing Responses/Codex prompt bypass and does not reorder those requests.
+
+Sorting is stable by exact tool name with original index as a tie-breaker. Unknown/custom transports, unsupported wrappers, malformed tools, missing/blank names, and other unverified shapes are no-ops. A top-level tool `cache_control` field on any supported shape is a deliberate no-op because native Anthropic and OpenAI-compatible Anthropic cache formatting attach breakpoints to a specific tool. Anthropic `defer_loading` tools are also no-ops because array order encodes immediate/deferred groups.
+
+The helper MUST retain tool-object and unrelated-field identity (including Google/Vertex `AbortSignal`) by shallow-cloning only root/container/tool arrays. The request hook MUST compose a changed payload with existing Anthropic TTL repair, retention safety, prompt-cache-key fallback, routing, and adapter behavior; it MUST NOT add trailing Anthropic breakpoints. The feature has no durable state. Unset the variable (or set a non-truthy value) and run `/reload` to roll back.
+
 ### Truncation guard (structural marker integrity)
 
 `optimizeSystemPrompt` uses `String.replace(part, "")` to extract
@@ -1053,7 +1061,7 @@ The extension registers a Pi command `/cache-optimizer` with runtime, diagnostic
 configuration, repair, and reset subcommands. It MUST register Pi's native
 `getArgumentCompletions(argumentPrefix)` callback rather than a custom editor or
 autocomplete provider. TypeScript validation consumes the installed official Pi
-0.84.3 declarations directly; a complete local ambient redeclaration is forbidden
+0.84.4 declarations directly; a complete local ambient redeclaration is forbidden
 because it can hide upstream API drift. Pi 0.84's expanded event/context surface
 is compatible with the subset used here. The callback completes the supported top-level
 subcommands (`enable`, `disable`, `doctor`, `stats`, `config`, `compat`, `reset`,

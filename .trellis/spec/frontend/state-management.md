@@ -33,6 +33,10 @@ Rules:
 - Recent samples are in-memory only and contain only numeric counters/booleans.
 - Runtime enable/disable is process-local and should not write settings files.
 
+### Deterministic tool-order state
+
+The `PI_CACHE_OPTIMIZER_TOOL_ORDER` experiment has no persistent or mutable global state. Its pure helper validates an allowlisted provider payload, computes a stable exact-name/index order, and returns either the original payload or a replacement that shallow-clones only the changed path. Tool objects and unrelated request fields retain identity. Any top-level tool `cache_control` marker, including one emitted by OpenAI-compatible Anthropic cache formatting, causes a no-op; Anthropic `defer_loading` grouping also causes a no-op.
+
 ### Persisted stats state
 
 Stats use a v7 shard store under `~/.pi/agent/pi-cache-optimizer-stats.d/`. Each loaded extension instance owns one UUID-named file in `shards/` and never edits another instance's shard.
@@ -81,3 +85,4 @@ Rules for `/cache-optimizer fix`:
 - Deleting a current-day closed child shard during shutdown or maintenance.
 - Using PID/PPID to decide stats ownership or parent-child attribution; they are diagnostics/cleanup hints only.
 - Storing full prompts in global singleton compatibility shims.
+- Sorting provider payloads in place, cloning unrelated SDK objects, moving any tool cache marker, or crossing Anthropic deferred-tool groups.

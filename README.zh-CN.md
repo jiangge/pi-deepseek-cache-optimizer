@@ -17,6 +17,7 @@
 - [安装](#安装)
 - [命令](#命令)
 - [持久 Opt-out](#持久-opt-out)
+- [Opt-in 确定性工具排序](#opt-in-确定性工具排序)
 - [Footer 缓存统计模式](#footer-缓存统计模式)
 - [OpenAI-compatible 代理配置](#openai-compatible-代理配置)
 - [Adaptive thinking 模型](#adaptive-thinking-模型)
@@ -38,6 +39,7 @@
 - 使用每个 extension instance 独占的原子 shard 保存缓存统计，避免父会话、子 Pi agent 和并行 Pi 进程互相覆盖。
 - Footer 默认显示当前 conversation session 的 provider/model 统计；`total` 可聚合同一精确 provider/model 的所有有效本地 shard。
 - 通过版本化全局协议（`Symbol.for("pi.routing.registry.v1")` 与 `Symbol.for("pi.cache.hints.v1")`）支持可选的 router extension 集成，而不导入任何 router 包。
+- 提供默认关闭的确定性排序，用于已验证的 Pi 内置工具 payload。
 
 缓存是 provider 侧的 best-effort 行为。第三方代理和 router extension 仍可能隐藏缓存 usage、拒绝不支持的参数，或把请求路由到多个上游。
 
@@ -57,7 +59,7 @@ pi remove npm:pi-deepseek-cache-optimizer && pi install npm:pi-cache-optimizer
 
 Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安装的 Pi package（包括本扩展），请运行 `pi update --extensions`（只更新 packages）或 `pi update --all`（Pi 与 packages 一起更新）。
 
-本扩展要求 Pi 0.82+，并已使用 Pi 0.84.3 验证。TypeScript 校验直接使用官方 Pi package 类型，同时只使用这些版本共有的 extension hooks、`getAgentDir()` 和 prompt options；不依赖 Pi 0.83+ 专有 API（例如 `ctx.scopedModels` 或 bundled TypeBox 1.3 aliases）。
+本扩展要求 Pi 0.82+，并已使用 Pi 0.84.4 验证。TypeScript 校验直接使用官方 Pi package 类型，同时只使用这些版本共有的 extension hooks、`getAgentDir()` 和 prompt options；不依赖 Pi 0.83+ 专有 API（例如 `ctx.scopedModels` 或 bundled TypeBox 1.3 aliases）。
 
 ## 命令
 
@@ -87,6 +89,22 @@ Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安
 | `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | 保留 Pi 原始 verbose skill XML。 |
 | `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` | 关闭 OpenAI-compatible `prompt_cache_key` fallback。推荐使用这个显式 opt-out。 |
 | `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` | 通过旧的反向开关关闭同一个 fallback。取值 `0`、`false`、`no`、`off` 时关闭。 |
+
+## Opt-in 确定性工具排序
+
+`PI_CACHE_OPTIMIZER_TOOL_ORDER=1` 会对 Pi 内置 OpenAI Completions、Anthropic、Google 与 Bedrock payload 中已验证的工具定义进行确定性排序。Truthy 取值为（不区分大小写）`1`、`true`、`yes` 或 `on`。该能力默认关闭、仅在当前进程生效，并会被 `/cache-optimizer disable` 抑制。
+
+工具按精确名称排序，并用原始 index 作为稳定的同名 tie-breaker。排序只对发生变化的已验证对象/数组路径做浅 clone。工具对象和无关请求字段保持原引用，包括 Google/Vertex 的 `AbortSignal`；工具 schema、tool choice、routing 字段和调用方输入都保持不变。
+
+出于安全考虑，只要工具存在顶层 `cache_control` marker，或 Anthropic payload 包含 `defer_loading` 分组，payload 就保持不变。未知 / 自定义 API、畸形工具、缺少名称或不支持的 shape 同样保持不变。纯 helper 可识别 OpenAI Responses fixture，但 request hook 保留既有 Responses/Codex bypass，不会重排这些请求。
+
+回滚很简单：删除变量或设为非 truthy 值，然后运行 `/reload`。如需使用本地 fixture 验证转换、且不连接 provider，可运行：
+
+```bash
+bun .trellis/tasks/09-03-context-epoch-tool-ordering/verify.ts
+```
+
+该 verifier 只报告数字形式的工具排序变化，并确认带 cache marker 的 payload 不会变化。由于它不会连接 provider，provider cache usage 会明确报告为 unavailable，也不会虚构 cache hit。
 
 ## Footer 缓存统计模式
 

@@ -67,6 +67,10 @@ Primary hooks/events:
 
 ### `before_provider_request`
 
+- If `PI_CACHE_OPTIMIZER_TOOL_ORDER` is explicitly truthy, pass only verified built-in OpenAI Completions, Anthropic, Google, and Bedrock shapes through the pure immutable tool normalizer. Google/Vertex uses Pi's real `payload.config.tools[].functionDeclarations` shape. Sort by exact name with original index as a tie-breaker and shallow-clone only the changed path so SDK objects and `AbortSignal` retain identity.
+- The pure helper recognizes the OpenAI Responses shape for fixture verification, but the request hook preserves the existing OpenAI Responses/Codex prompt bypass and does not reorder those requests.
+- Unknown/custom transports, unsupported wrappers, malformed tools, blank/missing names, any supported tool array with a top-level `cache_control`, and Anthropic arrays containing `defer_loading` are no-ops.
+- Compose the returned sorted payload with the existing TTL-order repair, retention safety, prompt-cache-key fallback, routing, and adapter behavior. Never add Anthropic trailing breakpoints.
 - For every effective `anthropic-messages` model, validate final cache breakpoints in `tools → system → messages` order and downgrade a visible invalid 5-minute-to-1-hour transition. Preserve legal third-party 1-hour retention unless this exact provider/model previously returned Anthropic's explicit TTL-ordering error in the current process.
 - Only inject OpenAI-compatible `prompt_cache_key` fallback for `openai-completions` / `openai-responses` APIs.
 - Preserve existing non-empty `prompt_cache_key` / `promptCacheKey` values.

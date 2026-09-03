@@ -17,6 +17,7 @@ Pi extension for improving provider-side KV / prompt cache hit rates. It keeps s
 - [Install](#install)
 - [Commands](#commands)
 - [Persistent opt-out](#persistent-opt-out)
+- [Opt-in deterministic tool ordering](#opt-in-deterministic-tool-ordering)
 - [Footer cache stats mode](#footer-cache-stats-mode)
 - [OpenAI-compatible proxy setup](#openai-compatible-proxy-setup)
 - [Adaptive thinking models](#adaptive-thinking-models)
@@ -38,6 +39,7 @@ Pi extension for improving provider-side KV / prompt cache hit rates. It keeps s
 - Stores cache statistics in per-extension-instance atomic shards, so parent sessions, child Pi agents, and parallel Pi processes cannot overwrite one another.
 - Shows current conversation-session provider/model footer stats by default; `total` aggregates all valid local shards for the exact provider/model.
 - Supports optional router-extension integration through versioned global protocols (`Symbol.for("pi.routing.registry.v1")` and `Symbol.for("pi.cache.hints.v1")`) without importing router packages.
+- Includes disabled-by-default deterministic ordering for verified built-in tool payloads.
 
 Caching is provider-side and best-effort. Third-party proxies and router extensions can still hide cache usage, reject unsupported parameters, or route requests across multiple upstreams.
 
@@ -57,7 +59,7 @@ Run `/reload` in Pi after install/update/remove so extension hooks refresh.
 
 On Pi 0.79.7 and newer, `pi update` updates Pi itself only. To update installed Pi packages such as this extension, run `pi update --extensions` (packages only) or `pi update --all` (Pi + packages).
 
-This extension requires Pi 0.82+ and is validated against Pi 0.84.3. It uses the official Pi package types directly for type-checking, along with extension hooks, `getAgentDir()`, and prompt options shared by those versions; it does not depend on Pi 0.83+ APIs such as `ctx.scopedModels` or the bundled TypeBox 1.3 aliases.
+This extension requires Pi 0.82+ and is validated against Pi 0.84.4. It uses the official Pi package types directly for type-checking, along with extension hooks, `getAgentDir()`, and prompt options shared by those versions; it does not depend on Pi 0.83+ APIs such as `ctx.scopedModels` or the bundled TypeBox 1.3 aliases.
 
 ## Commands
 
@@ -87,6 +89,22 @@ The interactive `/cache-optimizer` menu includes `Footer mode`, where you can ch
 | `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | Keep Pi's verbose skill XML. |
 | `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` | Disable the OpenAI-compatible `prompt_cache_key` fallback. Preferred explicit opt-out. |
 | `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` | Disable the same fallback via the legacy inverse switch. Values `0`, `false`, `no`, or `off` disable it. |
+
+## Opt-in deterministic tool ordering
+
+`PI_CACHE_OPTIMIZER_TOOL_ORDER=1` enables deterministic ordering for verified tool definitions in Pi's built-in OpenAI Completions, Anthropic, Google, and Bedrock payload shapes. Truthy values are `1`, `true`, `yes`, or `on` (case-insensitive). The feature is off by default, process-local, and suppressed by `/cache-optimizer disable`.
+
+Tools are sorted by exact name with their original index as the stable tie-breaker. The normalizer shallow-clones only the verified object/array path that changes. Tool objects and unrelated request fields retain their identity, including Google/Vertex `AbortSignal`; tool schemas, choices, routing fields, and caller input are preserved.
+
+For safety, payloads with any top-level tool `cache_control` marker or Anthropic `defer_loading` grouping are unchanged. Unknown/custom APIs, malformed tools, missing names, and unsupported shapes are also unchanged. The pure helper recognizes OpenAI Responses fixtures, but the request hook preserves the existing Responses/Codex bypass and does not reorder those requests.
+
+Rollback is immediate: unset the variable (or set a non-truthy value) and run `/reload`. To verify the transformation with local fixtures without contacting a provider, run:
+
+```bash
+bun .trellis/tasks/09-03-context-epoch-tool-ordering/verify.ts
+```
+
+The fixture verifier reports numeric tool-order changes and confirms cache-marked payloads remain unchanged. Because it does not contact a provider, provider cache usage is explicitly unavailable and no synthetic cache hit is claimed.
 
 ## Footer cache stats mode
 
