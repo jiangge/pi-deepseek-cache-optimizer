@@ -1,0 +1,40 @@
+[mainline]
+  schema_version = 1
+  main_branch = "master"
+  actor_log_prefix = "refs/mainline/actors"
+  require_seal_before = "push"
+  remote = "origin"
+  [mainline.skip]
+    patterns = ["^Merge pull request ", "^Merge branch ", "^chore: bump version", "^mainline: init"]
+  [mainline.coverage]
+    baseline_commit = "0e678ff5e025f37a341e0838a1e16161882b6579"
+
+[agent]
+  autonomy = "handoff"
+
+[sync]
+  auto_sync = true
+  interval = "30s"
+  freshness_seconds = 300
+  stale_threshold_seconds = 86400
+  auto_check_after_sync = true
+  auto_pin_after_sync = true
+
+[check]
+  auto_check = true
+  lookback = 50
+  phase1_threshold = 0.1
+  require_before_merge = false
+
+[publish]
+  auto_publish = false
+
+[merge]
+  strategy = "squash"
+
+[log]
+  default_limit = 20
+
+[hooks]
+  enabled = true
+  auto_sync_on_session_start = true
