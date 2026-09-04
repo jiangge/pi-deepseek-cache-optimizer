@@ -81,11 +81,14 @@ Primary hooks/events:
 
 - Record model-scoped 400 hints only for applicable prompt-cache-retention failures; the untouched Pi built-in `llama.cpp` compat fingerprint is excluded, while same-id overrides with explicit cache compat remain eligible.
 - Record model-scoped 403 hints only for applicable third-party OpenAI-compatible proxy failures (session-affinity headers or OpenAI SDK header/User-Agent diagnostics). The untouched built-in `llama.cpp` fingerprint and custom transports are excluded; provider id alone is not an exemption.
+- Detect reasoning-protocol evidence only for a DeepSeek-like `openai-completions` model receiving HTTP 400 evidence that explicitly rejects `thinking` and positively directs the caller to `reasoning_effort`. Evaluate each response header as an independent diagnostic unit, reject negated/disabled `reasoning_effort` guidance, retain only a process-local model key/category, and never persist or display the complete error. Notify that a later `/cache-optimizer fix` review or matching `/cache-optimizer rollback` may be available. Do not write or rollback from this hook.
+- Do not send hidden probe requests and do not infer protocol from model name, provider, URL, or `supportsReasoningEffort`.
 - Do not log payloads, headers, prompts, or credentials.
 
 ### `message_end`
 
 - Before the normal error/aborted stats early return, detect only Anthropic's explicit mixed-TTL ordering error and record a process-local provider/model fallback for the next subsequent request. This is a non-retryable 400 in Pi 0.82.1; do not promise built-in automatic retry. Do not classify generic 400 or prompt-too-long errors.
+- Also inspect finalized assistant errors for the same narrow reasoning-protocol rejection (`thinking` rejected in favor of `reasoning_effort`) and use request-local provider/model identity. Keep only the model-scoped category in process memory; never persist or display the raw error and never auto-edit configuration.
 - Assistant message metadata is authoritative for final stats identity.
 - Use message-local provider/model/api/usage when available; do not use global route state for final stats.
 - Update current-instance stats and recent samples only with numeric counters, then atomically persist the instance-owned shard.

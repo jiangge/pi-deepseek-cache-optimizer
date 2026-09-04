@@ -1,0 +1,32 @@
+{
+  "id": "deepseek-protocol-rollback",
+  "name": "deepseek-protocol-rollback",
+  "title": "Fix DeepSeek protocol compat and safe rollback",
+  "description": "",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "jiang",
+  "assignee": "jiang",
+  "createdAt": "2026-09-03",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "index.ts",
+    "tests/review-findings.test.ts",
+    "README.md",
+    "README.zh-CN.md",
+    ".trellis/tasks/09-03-deepseek-protocol-rollback/verify.ts"
+  ],
+  "notes": "Implementation and local verification are complete. The task remains in_progress because the working tree is intentionally uncommitted; no commit, push, publish, release, deployment, or other delivery operation is authorized without explicit approval.",
+  "meta": {}
+}

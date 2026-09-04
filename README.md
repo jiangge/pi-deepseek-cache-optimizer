@@ -9,7 +9,7 @@
 
 Pi extension for improving provider-side KV / prompt cache hit rates. It keeps stable prompt content near the front, adds a conservative OpenAI-compatible `prompt_cache_key` fallback, warns about common proxy cache-routing gaps, and shows read-only footer cache stats.
 
-> Renamed from `pi-deepseek-cache-optimizer`. Existing footer counters migrate automatically. The extension does **not** touch Pi's `models.json` during normal operation (default: `~/.pi/agent/models.json`; custom agent dirs use `PI_CODING_AGENT_DIR`); only `/cache-optimizer fix` can edit it, and only after an explicit interactive preview + confirmation with an automatic timestamped backup.
+> Renamed from `pi-deepseek-cache-optimizer`. Existing footer counters migrate automatically. The extension does **not** touch Pi's `models.json` during normal hook operation (default: `~/.pi/agent/models.json`; custom agent dirs use `PI_CODING_AGENT_DIR`). Only `/cache-optimizer fix` and `/cache-optimizer rollback` may edit it, both after an explicit interactive preview + confirmation with an automatic timestamped backup.
 
 ## Contents
 
@@ -22,6 +22,7 @@ Pi extension for improving provider-side KV / prompt cache hit rates. It keeps s
 - [OpenAI-compatible proxy setup](#openai-compatible-proxy-setup)
 - [Adaptive thinking models](#adaptive-thinking-models)
 - [Auto-repair with `/cache-optimizer fix`](#auto-repair-with-cache-optimizer-fix)
+- [DeepSeek protocol safety and rollback](#deepseek-protocol-safety-and-rollback)
 - [Footer stats](#footer-stats)
 - [For router / virtual-channel extension authors](#for-router--virtual-channel-extension-authors)
 - [Uninstall](#uninstall)
@@ -75,7 +76,8 @@ This extension requires Pi 0.82+ and is validated against Pi 0.84.4. It uses the
 | `/cache-optimizer stats contributors` | Shows current/other contributing sessions for the active exact provider/model without exposing session ids. |
 | `/cache-optimizer reset` | Resets local footer stats for the active provider/model; upstream provider cache is not modified. |
 | `/cache-optimizer config footer-mode total\|session\|process` | Persist the footer stats mode. Persistent command configuration overrides the environment variable. |
-| `/cache-optimizer fix` | Auto-repairs safe compat issues for the active model (adaptive thinking, DeepSeek reasoning, OpenAI proxy session affinity). Shows preview + risk warning, requires confirmation. **Only modifies `models.json` after explicit user approval.** |
+| `/cache-optimizer fix` | Auto-repairs safe compat issues for the active model. Shows preview + risk warning, requires confirmation. **Only modifies `models.json` after explicit user approval.** |
+| `/cache-optimizer rollback` | Reviews the latest matching confirmed fix and, after UI confirmation, restores it safely without overwriting unrelated `models.json` changes. |
 
 `/cache-optimizer` uses Pi's native Tab completion. Type `/cache-optimizer <Tab>` for the supported subcommands, `/cache-optimizer stats <Tab>` for `all` or `contributors`, `/cache-optimizer c<Tab>` for `config`, `/cache-optimizer config <Tab>` for `footer-mode`, and `/cache-optimizer config footer-mode <Tab>` for `total`, `session`, or `process`. Suggestions are prefix-filtered and invalid prefixes are left to Pi's normal fallback behavior.
 
@@ -160,7 +162,8 @@ Notes:
 - `supportsLongCacheRetention: true` is optional. Add it only when the endpoint explicitly supports OpenAI long prompt cache retention.
 - If you see `400 Unsupported parameter: prompt_cache_retention`, remove/avoid `supportsLongCacheRetention` for that channel. Keep `sendSessionAffinityHeaders` if supported. The extension detects the explicit error from response headers or the finalized assistant error message and strips the parameter from subsequent requests in the current process.
 - Use `/cache-optimizer compat` or `/cache-optimizer doctor` to see model-specific advice.
-- For DeepSeek models, the Pi Mono guidance expects `compat.requiresReasoningContentOnAssistantMessages: true` and `compat.thinkingFormat: "deepseek"` alongside cache/session-affinity flags when the endpoint supports them.
+- DeepSeek model names select the `DS cache` adapter only; they do not prove a reasoning wire protocol. Generic cache/routing advice remains active for absent or non-DeepSeek formats. DeepSeek replay advice is shown only when effective `compat.thinkingFormat: "deepseek"` is explicitly configured; it never treats `thinkingFormat` as a missing fix key.
+- Do not add `thinkingFormat: "deepseek"` merely because a model id contains `deepseek`; `openai`, `qwen`, `openrouter`, `together`, or no explicit format are all valid catalog cases.
 - This extension's `doctor` and `compat` commands only advise; they do not modify `models.json`.
 
 ## Anthropic cache TTL compatibility
@@ -241,7 +244,7 @@ Pi 0.80.9+ already includes Kimi K3 in built-in Kimi Coding, Moonshot AI / China
 **v2.6.0+** adds a `fix` subcommand that can auto-repair safe compat issues:
 
 - Adaptive thinking (`forceAdaptiveThinking: true`; Kimi Coding K3 / `kimi-for-coding` also `allowEmptySignature: true`)
-- DeepSeek Pi Mono reasoning compat (`thinkingFormat: "deepseek"`, `requiresReasoningContentOnAssistantMessages: true`)
+- DeepSeek Pi Mono replay compat (`requiresReasoningContentOnAssistantMessages: true` only when `thinkingFormat: "deepseek"` is already explicit; `/fix` never invents that format)
 - OpenAI-compatible proxy session affinity (`sendSessionAffinityHeaders: true` for `openai-completions`). Pi 0.80.7+ controls `openai-responses` header shape with `sessionAffinityFormat` and auto-detects its default; this extension no longer writes the removed `sendSessionIdHeader` field.
 
 **Scope:** only the currently active model. Other channels require switching models and running `fix` again.
@@ -254,13 +257,20 @@ Pi 0.80.9+ already includes Kimi K3 in built-in Kimi Coding, Moonshot AI / China
 4. Requires explicit user confirmation (interactive prompt or `ui.select`)
 5. Writes and restores atomically (temp + rename); self-validates after write
 6. Preserves the existing `models.json` access mode exactly — it does not tighten or loosen permissions (for example, `0600` stays `0600`, `0644` stays `0644`)
-7. Uses unique, non-overwriting backup names and falls back to manual guidance if the JSONC scanner cannot confidently locate the target
+7. Writes a privacy-safe, versioned receipt atomically only after a successful write; the receipt contains transaction/model identity, placement, scalar compat before/after values, file hashes, backup filename, timestamps/status, and no credentials or request data
+8. Uses unique, non-overwriting backup names and falls back to manual guidance if the JSONC scanner cannot confidently locate the target
 
-Existing `modelOverrides[modelId]` entries have Pi's highest precedence, so `fix` repairs them directly. For built-in or API-login models without a custom `models[]` entry, `fix` creates a compat-only `modelOverrides` entry instead of inventing a custom model definition. Self-validation checks the effective three-layer compat result, so a lower-level edit shadowed by an override is rejected.
+Existing `modelOverrides[modelId]` entries have Pi's highest precedence, so `fix` repairs them directly. For built-in or API-login models without a custom `models[]` entry, `fix` creates a compat-only `modelOverrides` entry instead of inventing a custom model definition. Runtime-observed provider failures are always written to that highest-precedence model override so extension-provided runtime compat cannot shadow the repair. Self-validation checks the full provider → custom model → runtime model → modelOverride result and rejects an ineffective lower-layer edit.
 
 **Non-interactive mode:** refuses to write; shows manual edit guidance instead.
 
 **Run:** `/cache-optimizer fix` when the active model has detected compat issues. The command shows "nothing to fix" when compat is already complete.
+
+## `/cache-optimizer rollback`
+
+Rollback is available through completion, direct execution, and the interactive menu. It always requires UI confirmation; without an interactive UI it gives manual-review guidance and does not write. The command selects the latest unapplied receipt for the active provider/model, validates the recorded backup and current file hashes, creates a new access-mode-preserving rollback backup, and uses temp-file + atomic rename. Fix and rollback transactions are serialized across extension instances; rollback also binds the receipt transaction id/hash from preview through commit and refuses if another transaction replaces it.
+
+If `models.json` is unchanged since the fix, rollback can restore the exact pre-fix JSONC. If the file changed, it never blindly replaces it: it may restore only receipt-owned scalar compat keys whose recorded post-fix values are still present, preserving later user changes. If a receipt-owned key changed, the target was removed/moved, or the fix created a new target entry, it refuses and points to the recorded backup for manual review. Successful rollback marks the receipt and requires `/reload` or a restart.
 
 ### Channels without a `models.json` provider entry
 
@@ -299,6 +309,21 @@ If only one model should change, use `modelOverrides`:
   }
 }
 ```
+
+## DeepSeek protocol safety and rollback
+
+Pi's model-family name and its reasoning wire protocol are separate. A DeepSeek-named model using an OpenAI-compatible endpoint may send standard top-level `reasoning_effort`, DeepSeek-style `thinking`, or another provider-specific format. `supportsReasoningEffort: true` alone is not proof either way. `/cache-optimizer fix` therefore never invents `thinkingFormat: "deepseek"`; configure an explicit `thinkingFormat` only when the endpoint documentation or an explicit provider signal supports it.
+
+The novice-safe workflow is staged:
+
+1. Run `/cache-optimizer fix` for protocol-neutral cache/routing repairs such as session affinity. It shows the exact placement and requires confirmation.
+2. Make a normal request. If an OpenAI-compatible DeepSeek-like model explicitly rejects the `thinking` parameter in favor of `reasoning_effort`, the extension keeps only a model-scoped, process-local category. It does not persist or display the complete provider error, send a hidden probe, or edit configuration from a response hook.
+3. Run `/cache-optimizer fix` again to review an evidence-based model-level protocol repair. It is written through the highest-precedence `modelOverrides[modelId].compat` layer and validated against runtime compat, so an extension-provided model cannot silently shadow it. A provider-level change is never broadened from a model name alone. Explicit `openai`, `qwen`, `openrouter`, and `together` formats remain respected.
+4. If the latest confirmed fix caused the problem, run `/cache-optimizer rollback`. Rollback always requires UI confirmation.
+
+Every successful interactive fix writes one atomic, versioned receipt at `pi-cache-optimizer-fix-receipt.json`. It contains only a transaction id, provider/model identity, placement, changed scalar compat keys with before/after values, file hashes, backup filename, and timestamps/status. It never stores API keys, credentials, prompts, payloads, headers, response bodies, or raw errors.
+
+Rollback creates a new access-mode-preserving backup and uses atomic replacement. If `models.json` is unchanged since the fix and the receipt backup matches the pre-fix hash, it can restore the exact pre-fix file. If the file changed, it only reverts receipt-owned scalar keys that still have their recorded post-fix values and preserves unrelated user changes; otherwise it refuses safely and points to the recorded backup for manual review. The receipt is marked rolled back after validation, and `/reload` or a restart is required.
 
 ## Footer stats
 

@@ -20,6 +20,35 @@ Any supported tool array carrying a top-level tool `cache_control` field is a de
 
 The task verifier uses deterministic local fixtures only. It may report changed-tool counts and unchanged cache-marker counts. It MUST NOT print prompts, prompt diffs, payloads, headers, session ids, credentials, response bodies, or usage values presented as provider cache evidence. Fixture-only runs must explicitly say that provider cache usage is unavailable and must never claim synthetic cache hits.
 
+## DeepSeek protocol and rollback privacy
+
+DeepSeek model id/name tokens may select the `DS cache` adapter, but they never
+prove a reasoning wire protocol. Only effective explicit
+`thinkingFormat: "deepseek"` on an `openai-completions` DeepSeek-like model may
+activate DeepSeek replay diagnostics. `supportsReasoningEffort`, provider ids,
+base URLs, and endpoint domains are not substitutes for that signal. The
+extension must not issue hidden probes or persist a guessed protocol.
+
+A reasoning rejection detector may inspect a response header or finalized
+assistant error only for the narrow direction “`thinking` is rejected; use
+`reasoning_effort`”. It stores only a model-scoped process-local category. It
+must never store, print, or log the complete error or any surrounding payload.
+The response hook never edits or rolls back configuration automatically.
+
+A successful interactive fix may write one receipt atomically. The receipt is
+allowlisted to transaction id, provider/model identity, placement, target
+existence, changed scalar compat before/after states, SHA-256 file hashes, a
+basename-only backup filename, timestamps, and rollback status. It excludes
+credentials, prompts, payloads, headers, response bodies, and raw errors.
+Rollback requires explicit UI confirmation. An unchanged file may be restored
+from a verified pre-fix backup; a changed file may only receive guarded
+surgical restoration of receipt-owned scalar keys whose post-fix values still
+match. Otherwise it refuses without overwriting user changes. Backups,
+replacements, and receipt writes use atomic operations and preserve the existing
+`models.json` access mode. Fix and rollback transactions serialize across
+extension instances; rollback binds the exact receipt transaction/hash from
+preview through commit and refuses if another transaction replaces it.
+
 ## Scenario: privacy-safe deterministic tool ordering
 
 ### 1. Scope / Trigger

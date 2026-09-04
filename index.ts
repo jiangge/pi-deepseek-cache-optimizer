@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, copyFile, lstat, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { constants as fsConstants, readFileSync, statSync, watch } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   getAgentDir,
   type BuildSystemPromptOptions,
@@ -114,6 +114,11 @@ const SHARD_GLOBAL_EPOCH_PATH = join(SHARD_EPOCH_DIR, "global.json");
 const SHARD_CLEANUP_LOCK_PATH = join(SHARD_MAINTENANCE_DIR, "cleanup.lock");
 const SHARD_CLEANUP_MARKER_PATH = join(SHARD_MAINTENANCE_DIR, "last-cleanup");
 const CONFIG_FILE_PATH = join(STATE_DIR, "pi-cache-optimizer-config.json");
+const FIX_RECEIPT_FILE_NAME = "pi-cache-optimizer-fix-receipt.json";
+const FIX_RECEIPT_PATH = join(STATE_DIR, FIX_RECEIPT_FILE_NAME);
+const MODELS_TRANSACTION_LOCK_PATH = join(STATE_DIR, "pi-cache-optimizer-models-transaction.lock");
+const MODELS_TRANSACTION_LOCK_STALE_MS = 60_000;
+const MODELS_TRANSACTION_LOCK_WAIT_MS = 5_000;
 const SHARD_RETENTION_MS = 48 * 60 * 60 * 1000;
 const SHARD_TEMP_RETENTION_MS = 24 * 60 * 60 * 1000;
 const SHARD_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -127,6 +132,46 @@ const NO_PROMPT_REWRITE_ENV = "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
 const TOOL_ORDER_ENV = "PI_CACHE_OPTIMIZER_TOOL_ORDER";
 const FOOTER_MODE_ENV = "PI_CACHE_OPTIMIZER_FOOTER_MODE";
 type FooterStatsMode = "session" | "total" | "process";
+type FixReceiptPlacement = "provider" | "model" | "modelOverride";
+type ReceiptScalar = string | number | boolean | null;
+type ReceiptScalarState =
+  | { present: false }
+  | { present: true; value: ReceiptScalar };
+type FixReceiptCompatChange = {
+  before: ReceiptScalarState;
+  after: ReceiptScalarState;
+};
+type ModelsJsonFixReceiptV1 = {
+  version: 1;
+  kind: "pi-cache-optimizer-fix-receipt";
+  transactionId: string;
+  provider: string;
+  modelId: string;
+  placement: FixReceiptPlacement;
+  targetExistedBefore: boolean;
+  changedKeys: Record<string, FixReceiptCompatChange>;
+  beforeHash: string;
+  afterHash: string;
+  backupFile: string;
+  createdAt: number;
+  appliedAt: number;
+  status?: "rolled_back";
+  rolledBackAt?: number;
+};
+
+// Receipts are trusted input to a later rollback command, so their key set is
+// deliberately narrower than the full models.json compat vocabulary. This
+// prevents a corrupted or hand-edited receipt from turning rollback into a
+// way to rewrite credentials, headers, routing, or arbitrary provider fields.
+const RECEIPT_COMPAT_KEYS = new Set([
+  "sendSessionAffinityHeaders",
+  "supportsLongCacheRetention",
+  "requiresReasoningContentOnAssistantMessages",
+  "forceAdaptiveThinking",
+  "allowEmptySignature",
+  "thinkingFormat",
+  "supportsReasoningEffort",
+]);
 type FooterStatsModeSource = "config" | "env" | "default";
 type PersistedCacheOptimizerConfigV1 = {
   version: 1;
@@ -136,12 +181,38 @@ const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("pi.routing.registry.v1");
 const PI_CACHE_HINTS_SYMBOL = Symbol.for("pi.cache.hints.v1");
 const PI_CACHE_HINTS_OWNER_SYMBOL = Symbol.for("pi.cache.optimizer.hints-owner.v1");
 const ANTHROPIC_TTL_FALLBACK_SYMBOL = Symbol.for("pi.cache.optimizer.anthropic-ttl-fallback.v1");
+const REASONING_PROTOCOL_FALLBACK_SYMBOL = Symbol.for("pi.cache.optimizer.reasoning-protocol-fallback.v1");
 
 type AnthropicTtlFallbackStateV1 = {
   version: 1;
   modelKeys: Set<string>;
   warnedModelKeys: Set<string>;
 };
+
+type ReasoningProtocolFallbackStateV1 = {
+  version: 1;
+  modelKeys: Set<string>;
+  warnedModelKeys: Set<string>;
+};
+
+function getReasoningProtocolFallbackState(): ReasoningProtocolFallbackStateV1 {
+  const globals = globalThis as Record<symbol, unknown>;
+  const existing = globals[REASONING_PROTOCOL_FALLBACK_SYMBOL] as Partial<ReasoningProtocolFallbackStateV1> | undefined;
+  if (
+    existing?.version === 1 &&
+    existing.modelKeys instanceof Set &&
+    existing.warnedModelKeys instanceof Set
+  ) {
+    return existing as ReasoningProtocolFallbackStateV1;
+  }
+  const state: ReasoningProtocolFallbackStateV1 = {
+    version: 1,
+    modelKeys: new Set<string>(),
+    warnedModelKeys: new Set<string>(),
+  };
+  globals[REASONING_PROTOCOL_FALLBACK_SYMBOL] = state;
+  return state;
+}
 
 function getAnthropicTtlFallbackState(): AnthropicTtlFallbackStateV1 {
   const globals = globalThis as Record<symbol, unknown>;
@@ -1250,15 +1321,21 @@ function routeSnapshotToPiModel(snapshot: PiRouteSnapshot, fallback?: PiModel): 
 }
 
 function findModelInRegistry(registry: ModelRegistryLike | undefined, provider: string, id: string): PiModel | undefined {
-  const found = registry?.find?.(provider, id);
-  if (found) return found;
+  try {
+    const found = registry?.find?.(provider, id);
+    if (found) return found;
 
-  const available = registry?.getAvailable?.() ?? [];
-  const availableMatch = available.find((candidate) => candidate.provider === provider && candidate.id === id);
-  if (availableMatch) return availableMatch;
+    const available = registry?.getAvailable?.() ?? [];
+    const availableMatch = available.find((candidate) => candidate.provider === provider && candidate.id === id);
+    if (availableMatch) return availableMatch;
 
-  const all = registry?.getAll?.() ?? [];
-  return all.find((candidate) => candidate.provider === provider && candidate.id === id);
+    const all = registry?.getAll?.() ?? [];
+    return all.find((candidate) => candidate.provider === provider && candidate.id === id);
+  } catch {
+    // Registry extensions are optional input; a malformed/throwing registry
+    // must not turn a provider error hook into a Pi session failure.
+    return undefined;
+  }
 }
 
 function isRoutedFallbackModel(model: PiModel | undefined): boolean {
@@ -1785,6 +1862,7 @@ const CACHE_OPTIMIZER_COMMANDS = [
   "compat",
   "reset",
   "fix",
+  "rollback",
 ] as const;
 const CACHE_OPTIMIZER_CONFIG_ARGUMENTS = ["footer-mode"] as const;
 const CACHE_OPTIMIZER_FOOTER_MODES = ["total", "session", "process"] as const;
@@ -2774,6 +2852,76 @@ function modelFromAssistantMessage(message: unknown, fallback: PiModel | undefin
   } as PiModel;
 }
 
+const REQUEST_SNAPSHOT_COMPAT_KEYS: Array<keyof CacheCompat> = [
+  "supportsStore",
+  "supportsDeveloperRole",
+  "supportsReasoningEffort",
+  "supportsUsageInStreaming",
+  "supportsStrictMode",
+  "maxTokensField",
+  "sendSessionAffinityHeaders",
+  "sessionAffinityFormat",
+  "supportsLongCacheRetention",
+  "thinkingFormat",
+  "requiresReasoningContentOnAssistantMessages",
+  "cacheControlFormat",
+  "forceAdaptiveThinking",
+  "allowEmptySignature",
+];
+
+function snapshotCompatForDiagnostics(model: PiModel): CacheCompat {
+  const source = getCompat(model);
+  const snapshot: CacheCompat = {};
+  const mutableSnapshot = snapshot as Record<string, unknown>;
+  for (const key of REQUEST_SNAPSHOT_COMPAT_KEYS) {
+    const value = source[key];
+    if (value !== undefined) mutableSnapshot[key] = value;
+  }
+  return snapshot;
+}
+
+function snapshotBaseUrlForDiagnostics(value: unknown): string {
+  if (!isNonEmptyString(value)) return "";
+  try {
+    const url = new URL(value);
+    // Request correlation only needs endpoint identity. Strip userinfo and
+    // query/fragment material so a provider URL cannot carry credentials into
+    // the process-local snapshot.
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    // Invalid endpoint strings are not useful for applicability checks. Keep
+    // only a conservative path-free origin-like prefix without userinfo.
+    return value.replace(new RegExp("//[^/?#\\s@]+@"), "//").split(/[?#]/, 1)[0];
+  }
+}
+
+function snapshotProviderRequestModel(model: PiModel | undefined): PiModel | undefined {
+  if (!model) return undefined;
+
+  // The provider response hooks do not receive the model that initiated the
+  // request (Pi's runner only forwards status/headers). Keep a process-local,
+  // credential-blind metadata snapshot so a model switch or route change
+  // between request and response cannot retarget a protocol observation. Do
+  // not retain the caller's complete model object or any request data.
+  return {
+    provider: model.provider,
+    id: model.id,
+    name: model.name,
+    api: model.api,
+    baseUrl: snapshotBaseUrlForDiagnostics(model.baseUrl),
+    compat: snapshotCompatForDiagnostics(model),
+    reasoning: model.reasoning ?? false,
+    input: model.input ?? ["text"],
+    cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: model.contextWindow ?? 0,
+    maxTokens: model.maxTokens ?? 0,
+  } as PiModel;
+}
+
 function keyForModelExt(model: { provider: string; id: string }): string {
   return `${model.provider}/${model.id}`;
 }
@@ -3139,6 +3287,259 @@ function hasPromptCacheRetentionUnsupportedErrorMessage(message: unknown): boole
     hasPromptCacheRetentionUnsupportedText(record.errorMessage);
 }
 
+function hasReasoningProtocolRejectionText(value: unknown): boolean {
+  const normalized = lower(value).replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+
+  // Match only a rejection that is attached to the `thinking` parameter. Do
+  // not merely look for both parameter names: `reasoning_effort is not
+  // supported; use thinking` is the opposite direction and must not activate
+  // this fallback.
+  const thinkingParameterRejectionPatterns = [
+    /(?:^|[^a-z0-9_])["'`]?thinking["'`]?(?:\s+(?:parameter|field|argument))?\s*(?:is\s+)?(?:not supported|unsupported|unknown|unrecognized|not allowed|not permitted|rejected|invalid|not valid|not accepted|disallowed|not a valid(?:\s+(?:parameter|field|argument))?)(?![a-z0-9_])/,
+    /(?:^|[^a-z0-9_])(?:unsupported|unknown|unrecognized|invalid|disallowed|rejected|not\s+(?:a\s+)?valid|not\s+accepted|not\s+allowed|not\s+permitted)(?:[_ ](?:parameter|field|argument))?\s*[:=]?\s*["'`]?thinking["'`]?(?![a-z0-9_])/,
+    /(?:^|[^a-z0-9_])(?:extra\s+inputs?|additional\s+(?:inputs?|parameters?))\s+(?:are\s+)?(?:not permitted|not allowed|unsupported)\s*[:=]?\s*["'`]?thinking["'`]?(?![a-z0-9_])/,
+  ];
+  let rejectionEnd = -1;
+  for (const pattern of thinkingParameterRejectionPatterns) {
+    const match = pattern.exec(normalized);
+    if (match && match.index + match[0].length > rejectionEnd) {
+      rejectionEnd = match.index + match[0].length;
+    }
+  }
+  if (rejectionEnd < 0) return false;
+
+  // The provider must direct the caller to reasoning_effort after the
+  // rejection. Limiting this to the short suffix after the matched rejection
+  // keeps generic documentation or an unrelated earlier sentence from being
+  // treated as runtime protocol evidence.
+  const recommendation = normalized.slice(rejectionEnd, rejectionEnd + 260);
+  if (!/\breasoning[_\.]effort\b/.test(recommendation)) return false;
+
+  const recommendationClauses = recommendation.split(/[.;!?\n]/);
+  return recommendationClauses.some((clause) => {
+    if (!/\breasoning[_\.]effort\b/.test(clause)) return false;
+    // A target mentioned inside a negated/disabled clause is not positive
+    // protocol guidance, even if words such as `must` or `supported` occur.
+    if (
+      /\b(?:do\s+not|don't|never|avoid)\s+(?:use|set|send|pass|provide)?\s*["'`]?reasoning[_\.]effort\b/.test(clause) ||
+      /\breasoning[_\.]effort\b[^.;]{0,80}\b(?:must|should|may|do)\s+(?:not|never)\b/.test(clause) ||
+      /\breasoning[_\.]effort\b[^.;]{0,80}\b(?:unsupported|disabled|unavailable|not\s+(?:supported|accepted|allowed|available|enabled|required|recommended|expected))\b/.test(clause)
+    ) return false;
+
+    return [
+      /(?:use|try|set|send|pass|provide)\s+(?:the\s+)?(?:top[- ]level\s+)?["'`]?reasoning[_\.]effort["'`]?(?![a-z0-9_])/,
+      /(?:reasoning[_\.]effort)\b[^.;]{0,120}(?:instead|required|must\s+be|should\s+be|is\s+(?:supported|accepted|preferred|recommended|expected))\b/,
+      /(?:parameter|field|option)\s+(?:is|should be)\s+["'`]?reasoning[_\.]effort["'`]?(?![a-z0-9_])/,
+      /instead[^.;]{0,120}(?:use|try|set|send|pass|provide)\s+(?:the\s+)?["'`]?reasoning[_\.]effort["'`]?(?![a-z0-9_])/,
+      /(?:replace|change|switch)\s+(?:the\s+)?["'`]?thinking["'`]?\s+(?:with|to)\s+["'`]?reasoning[_\.]effort["'`]?(?![a-z0-9_])/,
+    ].some((pattern) => pattern.test(clause));
+  });
+}
+
+function hasReasoningProtocolRejectionSignal(headers: Record<string, string> | undefined): boolean {
+  if (!headers) return false;
+  // Each response header is one diagnostic unit. Joining all values can pair a
+  // rejection from one header with unrelated documentation in another.
+  return Object.entries(headers).some(([key, headerValue]) =>
+    hasReasoningProtocolRejectionText(`${key}: ${headerValue}`)
+  );
+}
+
+function getOptionalAssistantHttpStatus(record: UnknownRecord): number | undefined {
+  const readStatus = (value: unknown): number | undefined => {
+    if (typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599) return value;
+    if (typeof value === "string" && /^\d{3}$/.test(value.trim())) {
+      const parsed = Number(value.trim());
+      return parsed >= 100 && parsed <= 599 ? parsed : undefined;
+    }
+    return undefined;
+  };
+
+  for (const key of ["status", "statusCode", "httpStatus", "httpStatusCode"]) {
+    const status = readStatus(record[key]);
+    if (status !== undefined) return status;
+  }
+
+  // Foreign/provider adapters sometimes put the HTTP status under a
+  // diagnostic `details`, `error`, or `cause` object rather than exposing it
+  // on the finalized assistant message itself. Traverse only these known
+  // diagnostic wrappers, with a small depth bound; never inspect arbitrary
+  // payload/message fields for a number that happens to look like a status.
+  const scanDiagnosticStatus = (value: unknown, depth: number): number | undefined => {
+    if (depth > 2) return undefined;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const status = scanDiagnosticStatus(item, depth + 1);
+        if (status !== undefined) return status;
+      }
+      return undefined;
+    }
+    const source = asRecord(value);
+    if (!source) return undefined;
+    for (const key of ["status", "statusCode", "httpStatus", "httpStatusCode", "code"]) {
+      const status = readStatus(source[key]);
+      if (status !== undefined) return status;
+    }
+    for (const key of ["details", "error", "cause", "diagnostics"]) {
+      const status = scanDiagnosticStatus(source[key], depth + 1);
+      if (status !== undefined) return status;
+    }
+    return undefined;
+  };
+  for (const key of ["diagnostics", "diagnostic", "details", "error", "cause"]) {
+    const status = scanDiagnosticStatus(record[key], 0);
+    if (status !== undefined) return status;
+  }
+
+  // Pi's built-in OpenAI-compatible adapters normally prefix a provider error
+  // body with the HTTP status (for example `400: {...}` or
+  // `OpenAI API error (400): ...`). Only parse status-shaped prefixes; never
+  // search arbitrary body text where a model id or payload number could be
+  // mistaken for a response status.
+  if (typeof record.errorMessage === "string") {
+    const errorText = record.errorMessage;
+    const matches = [
+      /^\s*([1-5]\d{2})\b/,
+      /^\s*(?:http(?:\s+status)?|status(?:\s+code)?)\s*[:(]?\s*([1-5]\d{2})\b/i,
+      /^\s*[^():\n]{1,100}\(\s*([1-5]\d{2})\b/,
+      /^\s*(?:error|api\s+error|provider\s+error|request\s+failed|http\s+error)\s*[:(]\s*([1-5]\d{2})\b/i,
+    ];
+    for (const pattern of matches) {
+      const match = pattern.exec(errorText);
+      if (match) return Number(match[1]);
+    }
+  }
+  return undefined;
+}
+
+function hasReasoningProtocolRejectionErrorMessage(message: unknown): boolean {
+  const record = getAssistantRecord(message);
+  if (!record || record.stopReason !== "error") return false;
+  // Finalized assistant messages do not expose a separate status field in the
+  // normal Pi path, so recover it only from structured diagnostics or the
+  // adapter's status-shaped error prefix. A text-only 400-looking parameter
+  // message is not enough evidence for a protocol repair.
+  return getOptionalAssistantHttpStatus(record) === 400 &&
+    hasReasoningProtocolRejectionText(record.errorMessage);
+}
+
+function isReasoningProtocolRejectionSignalApplicable(model: PiModel | undefined): boolean {
+  // A provider error can teach us which protocol it expects, so this gate is
+  // intentionally broader than the explicit DeepSeek-format diagnostic gate.
+  // The model family identifies the affected cache/compat bucket; the error
+  // text, not the model name, supplies the wire-protocol evidence.
+  return !!model && isOpenAICompatibleProxyApi(model.api) && isDeepSeekLikeModel(model);
+}
+
+function isReasoningProtocolRejectionForModel(message: unknown, model: PiModel | undefined): boolean {
+  if (!model || !isReasoningProtocolRejectionSignalApplicable(model)) return false;
+  if (!hasReasoningProtocolRejectionErrorMessage(message)) return false;
+  const record = getAssistantRecord(message);
+  if (!record) return false;
+  const messageProvider = firstNonEmptyString(record.provider);
+  const messageModel = firstNonEmptyString(record.responseModel, record.model);
+  // An explicit identity in the finalized assistant error is authoritative.
+  // Do not broaden a model-scoped observation to another DeepSeek-named model.
+  return (!messageProvider || messageProvider === model.provider) &&
+    (!messageModel || messageModel === model.id);
+}
+
+async function notifyReasoningProtocolObservation(
+  model: PiModel,
+  ctx: Pick<ExtensionContext, "ui">,
+  rejectedModelKeys: Set<string>,
+  warnedModelKeys: Set<string>,
+): Promise<void> {
+  const key = modelKey(model);
+  rejectedModelKeys.add(key);
+  if (warnedModelKeys.has(key)) return;
+  warnedModelKeys.add(key);
+
+  const receipt = await readModelsJsonFixReceipt();
+  const matchingReceipt = isActionableModelsJsonFixReceipt(receipt) &&
+    receipt.provider === model.provider &&
+    receipt.modelId === model.id;
+  const recovery = matchingReceipt
+    ? "A matching confirmed fix receipt exists; run /cache-optimizer rollback to undo it safely."
+    : "Run /cache-optimizer fix to review a model-scoped repair.";
+  ctx.ui.notify(
+    `⚠️ ${LOG_PREFIX}: ${key} rejected the configured reasoning format. ${recovery} ` +
+    "No configuration was changed automatically.",
+    "warning",
+  );
+}
+
+function fixSuggestionIdentity(model: PiModel): { providerLabel: string; modelId: string } {
+  const key = modelKey(model);
+  const slashIdx = key.indexOf("/");
+  return {
+    providerLabel: slashIdx > 0 ? key.slice(0, slashIdx) : key,
+    modelId: model.id,
+  };
+}
+
+function mergeFixSuggestions(...suggestions: Array<FixSuggestion | undefined>): FixSuggestion | undefined {
+  const present = suggestions.filter((suggestion): suggestion is FixSuggestion => suggestion !== undefined);
+  if (present.length === 0) return undefined;
+  const first = present[0];
+  return {
+    providerLabel: first.providerLabel,
+    modelId: first.modelId,
+    compatKeys: Object.assign({}, ...present.map((suggestion) => suggestion.compatKeys)),
+    forceModelLevel: present.some((suggestion) => suggestion.forceModelLevel === true),
+  };
+}
+
+function buildReasoningProtocolFixSuggestion(
+  model: PiModel,
+  protocolRejectionObserved = false,
+): FixSuggestion | undefined {
+  if (!protocolRejectionObserved) return undefined;
+  if (!isDeepSeekLikeModel(model) || !isOpenAICompatibleProxyApi(model.api)) return undefined;
+
+  const compat = getCompat(model);
+  // Explicit provider-specific formats are user/provider evidence in their own
+  // right. Do not replace qwen/openrouter/together/etc. merely because a
+  // generic error happened to mention both reasoning parameter names. The
+  // evidence-driven repair is limited to the old DeepSeek `thinking` format,
+  // an explicit standard OpenAI format, or an absent format that needs to be
+  // made unambiguous after the provider's rejection.
+  if (
+    compat.thinkingFormat !== undefined &&
+    compat.thinkingFormat !== "deepseek" &&
+    compat.thinkingFormat !== "openai"
+  ) {
+    return undefined;
+  }
+
+  const identity = fixSuggestionIdentity(model);
+  const compatKeys: Record<string, unknown> = {};
+  if (compat.thinkingFormat !== "openai") {
+    compatKeys.thinkingFormat = "openai";
+  }
+  if (compat.supportsReasoningEffort !== true) {
+    compatKeys.supportsReasoningEffort = true;
+  }
+
+  // Replay behavior is changed only when the current effective configuration
+  // actually enabled it. Never invent a false value merely because the model
+  // family is named DeepSeek or because a provider supports reasoning effort.
+  if (compat.requiresReasoningContentOnAssistantMessages === true) {
+    compatKeys.requiresReasoningContentOnAssistantMessages = false;
+  }
+  if (Object.keys(compatKeys).length === 0) return undefined;
+
+  return {
+    ...identity,
+    // Protocol observations are always model-scoped. A provider may expose
+    // DeepSeek-named models with different wire formats, so sibling models
+    // must never inherit this evidence-driven change.
+    compatKeys,
+    forceModelLevel: true,
+  };
+}
+
 type CompatAdvicePlacement = {
   providerLabel?: string;
   modelId?: string;
@@ -3237,7 +3638,7 @@ function buildOpenAIProxyCompatWarningText(key: string, missing: string[]): stri
 
   const modelsJsonPath = getModelsJsonDisplayPath();
   const lines: string[] = [
-    `💡 pi-cache-optimizer: ${key} is a third-party GPT/OpenAI-compatible proxy but merged compat lacks ${missing.join(" and ")}.`,
+    `💡 pi-cache-optimizer: ${key} is a third-party OpenAI-compatible proxy but merged compat lacks ${missing.join(" and ")}.`,
     `Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (at the same level as baseUrl/api/apiKey/models).`,
     ``,
   ];
@@ -3247,80 +3648,82 @@ function buildOpenAIProxyCompatWarningText(key: string, missing: string[]): stri
   return lines.join("\n");
 }
 
+/**
+ * DeepSeek's model family and its reasoning wire protocol are separate facts.
+ * The family name selects the cache adapter, but only an explicit effective
+ * `thinkingFormat: "deepseek"` opts a third-party OpenAI Completions model into
+ * the reasoning/replay compat checks below. Model names, provider ids, URLs,
+ * and supportsReasoningEffort are not protocol evidence.
+ */
+function isDeepSeekWireCompatApplicable(model: PiModel): boolean {
+  // `thinkingFormat` is the only wire-protocol signal. The model family is
+  // still name/id based for adapter selection, while provider, URL, and
+  // supportsReasoningEffort remain deliberately irrelevant here.
+  return isDeepSeekLikeModel(model)
+    && isOpenAICompatibleProxyApi(model.api)
+    && getCompat(model).thinkingFormat === "deepseek";
+}
+
 function describeMissingDeepSeekCompat(model: PiModel): string[] {
+  if (!isDeepSeekWireCompatApplicable(model)) return [];
+
   const compat = getCompat(model);
   const missing: string[] = [];
-
-  if (compat.supportsLongCacheRetention !== true) {
-    missing.push("supportsLongCacheRetention");
-  }
-  if (model.api !== "openai-responses" && compat.sendSessionAffinityHeaders !== true) {
-    missing.push("sendSessionAffinityHeaders");
-  }
   if (compat.requiresReasoningContentOnAssistantMessages !== true) {
     missing.push("requiresReasoningContentOnAssistantMessages");
   }
-  if (compat.thinkingFormat !== "deepseek") {
-    missing.push("thinkingFormat");
-  }
-
   return missing;
 }
 
+/**
+ * Compatibility diagnostics for a DeepSeek-like model are generic unless the
+ * user has explicitly selected Pi's DeepSeek reasoning wire format. In
+ * particular, never manufacture `thinkingFormat: "deepseek"`: doing so can
+ * turn a valid reasoning_effort request into a provider-rejected `thinking`
+ * request (Issue #10).
+ */
 function isDeepSeekCompatCheckApplicable(model: PiModel): boolean {
-  return isDeepSeekLikeModel(model)
-    && isOpenAICompatibleApi(model.api)
-    && isKnownThirdPartyOpenAIEndpoint(model)
-    && !isPiBuiltInLlamaCppModel(model);
+  return isDeepSeekWireCompatApplicable(model);
+}
+
+function hasExplicitDeepSeekReasoningProtocol(model: PiModel): boolean {
+  return isDeepSeekWireCompatApplicable(model);
 }
 
 function describeMissingCacheCompatForModel(model: PiModel): string[] {
   if (isAdaptiveThinkingCompatApplicable(model)) {
     return describeMissingAdaptiveThinkingCompat(model);
   }
-  if (isDeepSeekCompatCheckApplicable(model)) {
-    return describeMissingDeepSeekCompat(model);
+
+  const missing = describeMissingOpenAICompatibleProxyCompat(model);
+  if (isDeepSeekWireCompatApplicable(model)) {
+    missing.push(...describeMissingDeepSeekCompat(model));
   }
-  return describeMissingOpenAICompatibleProxyCompat(model);
+  return missing;
 }
 
 function buildDeepSeekCompatSuggestion(missing: string[]): Record<string, unknown> {
-  const suggestion: Record<string, unknown> = {};
-
-  if (missing.includes("supportsLongCacheRetention")) {
-    suggestion.supportsLongCacheRetention = true;
-  }
-  if (missing.includes("sendSessionAffinityHeaders")) {
-    suggestion.sendSessionAffinityHeaders = true;
-  }
+  const suggestion: Record<string, unknown> = {
+    ...buildSafeOpenAIProxyCompatSuggestion(missing),
+  };
   if (missing.includes("requiresReasoningContentOnAssistantMessages")) {
     suggestion.requiresReasoningContentOnAssistantMessages = true;
   }
-  if (missing.includes("thinkingFormat")) {
-    suggestion.thinkingFormat = "deepseek";
-  }
-
   return suggestion;
 }
 
 function appendDeepSeekCompatAdviceLines(lines: string[], missing: string[], placement: CompatAdvicePlacement = {}): void {
   const suggestion = buildDeepSeekCompatSuggestion(missing);
   if (Object.keys(suggestion).length > 0) {
-    lines.push("Recommended DeepSeek compat snippet:");
+    lines.push("Recommended DeepSeek reasoning/replay compat snippet:");
     lines.push(JSON.stringify(suggestion, null, 2));
   }
 
   if (missing.includes("requiresReasoningContentOnAssistantMessages")) {
-    lines.push('- requiresReasoningContentOnAssistantMessages: true keeps replayed assistant turns compatible with DeepSeek reasoning_content requirements.');
-  }
-  if (missing.includes("thinkingFormat")) {
-    lines.push('- thinkingFormat: "deepseek" tells Pi to use DeepSeek reasoning/thinking parameter format.');
+    lines.push('- requiresReasoningContentOnAssistantMessages: true keeps replayed assistant turns compatible with an explicitly selected DeepSeek reasoning wire format.');
   }
   if (missing.includes("sendSessionAffinityHeaders")) {
-    lines.push("- sendSessionAffinityHeaders: recommended for OpenAI-compatible DeepSeek proxies when supported; it helps keep one Pi session on the same upstream/backend.");
-  }
-  if (missing.includes("supportsLongCacheRetention")) {
-    lines.push("- supportsLongCacheRetention: enable for DeepSeek-compatible endpoints that support long cache retention.");
+    lines.push("- sendSessionAffinityHeaders: recommended for third-party OpenAI-compatible proxies when supported; it helps keep one Pi session on the same upstream/backend.");
   }
 
   appendCredentialSafeProviderGuidance(lines, placement, suggestion);
@@ -3355,13 +3758,13 @@ const CACHE_PROVIDER_ADAPTERS: CacheProviderAdapter[] = [
       return normalizeWithFallback(message, getDeepSeekRawUsage, { allowInputOnlyPiUsage: true });
     },
     warningText(model) {
-      if (!isDeepSeekCompatCheckApplicable(model)) return undefined;
-
-      const missing = describeMissingDeepSeekCompat(model);
+      const missing = describeMissingCacheCompatForModel(model);
       if (missing.length === 0) return undefined;
 
       const key = modelKey(model);
-      return buildDeepSeekCompatWarningText(key, missing);
+      return isDeepSeekWireCompatApplicable(model)
+        ? buildDeepSeekCompatWarningText(key, missing)
+        : buildOpenAIProxyCompatWarningText(key, missing);
     },
   },
   {
@@ -4324,6 +4727,10 @@ function notifyCacheCompatIfNeeded(
   warnedModels: Set<string>,
 ): void {
   if (!model) return;
+
+  // A protocol rejection is retained separately from ordinary compat warnings;
+  // it is surfaced once by the response hook and can be used by a later fix.
+  // Do not turn it into an automatic write here.
 
   // Native anthropic-messages adaptive thinking compat check.
   // Adapter warningText only fires for OpenAI-compatible APIs, so native
@@ -5714,7 +6121,7 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
   const adaptiveThinkingApplicable = isAdaptiveThinkingCompatApplicable(model);
   const deepSeekCompatApplicable = isDeepSeekCompatCheckApplicable(model);
   const missing = describeMissingCacheCompatForModel(model);
-  const optionalOpenAIProxyCompat = (!adaptiveThinkingApplicable && !deepSeekCompatApplicable)
+  const optionalOpenAIProxyCompat = !adaptiveThinkingApplicable
     ? describeOptionalOpenAICompatibleProxyCompat(model)
     : [];
   const fixSug = buildFixSuggestion(model);
@@ -5738,6 +6145,7 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
       appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
     } else if (deepSeekCompatApplicable) {
       appendDeepSeekCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
+      appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
     } else {
       appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
       appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
@@ -5948,7 +6356,7 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
   const advisoryMissingC = missing.filter(m => !safeFixableMissingC.includes(m));
   const adaptiveThinkingApplicable = isAdaptiveThinkingCompatApplicable(model);
   const deepSeekCompatApplicable = isDeepSeekCompatCheckApplicable(model);
-  const optionalOpenAIProxyCompat = (!adaptiveThinkingApplicable && !deepSeekCompatApplicable)
+  const optionalOpenAIProxyCompat = !adaptiveThinkingApplicable
     ? describeOptionalOpenAICompatibleProxyCompat(model)
     : [];
   const routerNotes = describeRouterChannelDiagnostics(model);
@@ -5976,6 +6384,7 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
       appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
     } else if (deepSeekCompatApplicable) {
       appendDeepSeekCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
+      appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
     } else {
       appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
       appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
@@ -6128,19 +6537,25 @@ function skipJsonValue(text: string, pos: number): number | undefined {
 /**
  * Find a top-level key in the object whose `{` is at `openBracePos`.
  * Only direct children are considered (nested values are skipped whole).
- * Returns the key's opening-quote offset and its value's start offset,
- * or undefined when the key is absent or the object is malformed.
+ * When duplicate keys exist, return the last one so scanning follows
+ * JSON.parse/Pi's effective last-definition-wins behavior. `count` lets
+ * callers refuse an ambiguous surgical edit rather than silently selecting a
+ * user-added duplicate. Return undefined when the key is absent or the object
+ * is malformed.
  */
 function findJsonObjectKey(
   text: string,
   openBracePos: number,
   targetKey: string,
-): { keyStart: number; valueStart: number } | undefined {
+): { keyStart: number; valueStart: number; count: number } | undefined {
   if (text[openBracePos] !== "{") return undefined;
   let i = openBracePos + 1;
+  let found: { keyStart: number; valueStart: number; count: number } | undefined;
+  let count = 0;
   while (i < text.length) {
     i = skipJsonWhitespace(text, i);
-    if (i >= text.length || text[i] === "}") return undefined;
+    if (i >= text.length) return undefined;
+    if (text[i] === "}") return found;
     if (text[i] === ",") {
       i++;
       continue;
@@ -6152,7 +6567,10 @@ function findJsonObjectKey(
     i = skipJsonWhitespace(text, key.end);
     if (text[i] !== ":") return undefined;
     i = skipJsonWhitespace(text, i + 1);
-    if (key.value === targetKey) return { keyStart, valueStart: i };
+    if (key.value === targetKey) {
+      count++;
+      found = { keyStart, valueStart: i, count };
+    }
     const after = skipJsonValue(text, i);
     if (after === undefined) return undefined;
     i = after;
@@ -6384,6 +6802,8 @@ function hasExplicitLongRetentionOptInFromConfig(
  * Returns the byte offsets for surgical insertion, or undefined if ambiguous.
  */
 interface ModelNodeLocation {
+  /** Number of exact provider keys found in the root providers object. */
+  providerKeyCount: number;
   /** Offset of the model object's opening `{` */
   modelObjectBrace: number;
   /** Offset of the model object's closing `}` */
@@ -6412,11 +6832,21 @@ interface ModelNodeLocation {
   modelOverrideCompatBrace: number;
   /** Offset of the target override compat object's closing `}`, or -1 if absent */
   modelOverrideCompatEnd: number;
+  /** Number of exact modelOverrides keys for this model id. */
+  modelOverrideKeyCount: number;
+  /** Number of exact compat keys in the selected model object. */
+  modelCompatKeyCount: number;
+  /** Number of exact provider compat keys. */
+  providerCompatKeyCount: number;
   /** All model ids found in this provider's models array (for placement safety analysis) */
   allModelIds: string[];
 }
 
 interface ModelOverrideNodeLocation {
+  providerKeyCount: number;
+  modelOverridesKeyCount: number;
+  modelOverrideKeyCount: number;
+  modelOverrideCompatKeyCount: number;
   providerObjectBrace: number;
   providerObjectEnd: number;
   modelOverridesObjectBrace: number;
@@ -6437,17 +6867,21 @@ function locateModelOverrideInJsonc(
   const rootBrace = skipJsonWhitespace(clean, 0);
   if (clean[rootBrace] !== "{") return undefined;
   const providersKey = findJsonObjectKey(clean, rootBrace, "providers");
-  if (!providersKey) return undefined;
+  if (!providersKey || providersKey.count !== 1) return undefined;
   const providersBrace = skipJsonWhitespace(clean, providersKey.valueStart);
   if (clean[providersBrace] !== "{") return undefined;
   const providersEnd = findMatchingBracket(clean, providersBrace);
   if (providersEnd === undefined) return undefined;
   const providerKey = findJsonObjectKey(clean, providersBrace, providerLabel);
-  if (!providerKey || providerKey.keyStart > providersEnd) return undefined;
+  if (!providerKey || providerKey.count !== 1 || providerKey.keyStart > providersEnd) return undefined;
   const providerObjectBrace = skipJsonWhitespace(clean, providerKey.valueStart);
   if (clean[providerObjectBrace] !== "{") return undefined;
   const providerObjectEnd = findMatchingBracket(clean, providerObjectBrace);
   if (providerObjectEnd === undefined || providerObjectEnd > providersEnd) return undefined;
+  const providerCompatKey = findJsonObjectKey(clean, providerObjectBrace, "compat");
+  if (providerCompatKey?.count && providerCompatKey.count > 1) return undefined;
+  const modelsKey = findJsonObjectKey(clean, providerObjectBrace, "models");
+  if (modelsKey?.count && modelsKey.count > 1) return undefined;
 
   let modelOverridesObjectBrace = -1;
   let modelOverridesObjectEnd = -1;
@@ -6455,7 +6889,10 @@ function locateModelOverrideInJsonc(
   let modelOverrideObjectEnd = -1;
   let modelOverrideCompatBrace = -1;
   let modelOverrideCompatEnd = -1;
+  let modelOverrideKeyCount = 0;
+  let modelOverrideCompatKeyCount = 0;
   const overridesKey = findJsonObjectKey(clean, providerObjectBrace, "modelOverrides");
+  if (overridesKey?.count && overridesKey.count > 1) return undefined;
   if (overridesKey && overridesKey.keyStart < providerObjectEnd) {
     const brace = skipJsonWhitespace(clean, overridesKey.valueStart);
     if (clean[brace] !== "{") return undefined;
@@ -6465,6 +6902,8 @@ function locateModelOverrideInJsonc(
     modelOverridesObjectEnd = end;
 
     const overrideKey = findJsonObjectKey(clean, brace, modelId);
+    modelOverrideKeyCount = overrideKey?.count ?? 0;
+    if (overrideKey?.count && overrideKey.count > 1) return undefined;
     if (overrideKey && overrideKey.keyStart < end) {
       const entryBrace = skipJsonWhitespace(clean, overrideKey.valueStart);
       if (clean[entryBrace] !== "{") return undefined;
@@ -6474,6 +6913,8 @@ function locateModelOverrideInJsonc(
       modelOverrideObjectEnd = entryEnd;
 
       const compatKey = findJsonObjectKey(clean, entryBrace, "compat");
+      modelOverrideCompatKeyCount = compatKey?.count ?? 0;
+      if (compatKey?.count && compatKey.count > 1) return undefined;
       if (compatKey && compatKey.keyStart < entryEnd) {
         const compatBrace = skipJsonWhitespace(clean, compatKey.valueStart);
         if (clean[compatBrace] !== "{") return undefined;
@@ -6486,6 +6927,10 @@ function locateModelOverrideInJsonc(
   }
 
   return {
+    providerKeyCount: providerKey.count,
+    modelOverridesKeyCount: overridesKey?.count ?? 0,
+    modelOverrideKeyCount,
+    modelOverrideCompatKeyCount,
     providerObjectBrace,
     providerObjectEnd,
     modelOverridesObjectBrace,
@@ -6520,14 +6965,14 @@ function locateModelInJsonc(
   if (clean[rootBrace] !== "{") return undefined;
 
   const providersKey = findJsonObjectKey(clean, rootBrace, "providers");
-  if (!providersKey) return undefined;
+  if (!providersKey || providersKey.count !== 1) return undefined;
   const providersBrace = skipJsonWhitespace(clean, providersKey.valueStart);
   if (clean[providersBrace] !== "{") return undefined;
   const providersEnd = findMatchingBracket(clean, providersBrace);
   if (providersEnd === undefined) return undefined;
 
   const providerKey = findJsonObjectKey(clean, providersBrace, providerLabel);
-  if (!providerKey || providerKey.keyStart > providersEnd) return undefined;
+  if (!providerKey || providerKey.count !== 1 || providerKey.keyStart > providersEnd) return undefined;
   const providerBrace = skipJsonWhitespace(clean, providerKey.valueStart);
   if (clean[providerBrace] !== "{") return undefined;
   const providerEndBrace = findMatchingBracket(clean, providerBrace);
@@ -6538,14 +6983,33 @@ function locateModelInJsonc(
   let providerCompatBrace = -1;
   let providerCompatEnd = -1;
   const providerCompatKey = findJsonObjectKey(clean, providerBrace, "compat");
+  const providerCompatKeyCount = providerCompatKey?.count ?? 0;
+  if (providerCompatKey?.count && providerCompatKey.count > 1) return undefined;
   if (providerCompatKey && providerCompatKey.keyStart < providerEndBrace) {
     const brace = skipJsonWhitespace(clean, providerCompatKey.valueStart);
-    if (clean[brace] === "{") {
-      const end = findMatchingBracket(clean, brace);
-      if (end !== undefined && end <= providerEndBrace) {
-        providerCompatBrace = brace;
-        providerCompatEnd = end;
-      }
+    if (clean[brace] !== "{") return undefined;
+    const end = findMatchingBracket(clean, brace);
+    if (end === undefined || end > providerEndBrace) return undefined;
+    providerCompatBrace = brace;
+    providerCompatEnd = end;
+  }
+
+  const modelOverridesKey = findJsonObjectKey(clean, providerBrace, "modelOverrides");
+  if (modelOverridesKey?.count && modelOverridesKey.count > 1) return undefined;
+  if (modelOverridesKey) {
+    const modelOverridesBrace = skipJsonWhitespace(clean, modelOverridesKey.valueStart);
+    if (clean[modelOverridesBrace] !== "{") return undefined;
+    const modelOverridesEnd = findMatchingBracket(clean, modelOverridesBrace);
+    if (modelOverridesEnd === undefined || modelOverridesEnd > providerEndBrace) return undefined;
+    const overrideKey = findJsonObjectKey(clean, modelOverridesBrace, modelId);
+    if (overrideKey?.count && overrideKey.count > 1) return undefined;
+    if (overrideKey) {
+      const overrideBrace = skipJsonWhitespace(clean, overrideKey.valueStart);
+      if (clean[overrideBrace] !== "{") return undefined;
+      const overrideEnd = findMatchingBracket(clean, overrideBrace);
+      if (overrideEnd === undefined || overrideEnd > modelOverridesEnd) return undefined;
+      const overrideCompatKey = findJsonObjectKey(clean, overrideBrace, "compat");
+      if (overrideCompatKey?.count && overrideCompatKey.count > 1) return undefined;
     }
   }
 
@@ -6556,7 +7020,7 @@ function locateModelInJsonc(
   const modelOverrideCompatEnd = overrideLocation?.modelOverrideCompatEnd ?? -1;
 
   const modelsKey = findJsonObjectKey(clean, providerBrace, "models");
-  if (!modelsKey || modelsKey.keyStart > providerEndBrace) return undefined;
+  if (!modelsKey || modelsKey.count !== 1 || modelsKey.keyStart > providerEndBrace) return undefined;
 
   let modelsScan = skipJsonWhitespace(clean, modelsKey.valueStart);
   if (clean[modelsScan] !== "[") return undefined;
@@ -6571,6 +7035,7 @@ function locateModelInJsonc(
   let compatKeyStartClean = -1;
   let compatBrace = -1;
   let compatEndBrace = -1;
+  let modelCompatKeyCount = 0;
 
   while (modelsScan < modelsEnd) {
     modelsScan = skipJsonWhitespace(clean, modelsScan);
@@ -6586,6 +7051,7 @@ function locateModelInJsonc(
     if (elementEnd === undefined || elementEnd > modelsEnd) return undefined;
 
     const idKey = findJsonObjectKey(clean, elementBrace, "id");
+    if (idKey?.count && idKey.count > 1) return undefined;
     let elementId: string | undefined;
     if (idKey && idKey.keyStart < elementEnd) {
       const idValueStart = skipJsonWhitespace(clean, idKey.valueStart);
@@ -6609,16 +7075,16 @@ function locateModelInJsonc(
       compatEndBrace = -1;
 
       const compatKey = findJsonObjectKey(clean, modelBrace, "compat");
+      modelCompatKeyCount = compatKey?.count ?? 0;
+      if (compatKey?.count && compatKey.count > 1) return undefined;
       if (compatKey && compatKey.keyStart < modelEndBrace) {
         compatKeyStartClean = compatKey.keyStart;
         const brace = skipJsonWhitespace(clean, compatKey.valueStart);
-        if (clean[brace] === "{") {
-          const end = findMatchingBracket(clean, brace);
-          if (end !== undefined && end <= modelEndBrace) {
-            compatBrace = brace;
-            compatEndBrace = end;
-          }
-        }
+        if (clean[brace] !== "{") return undefined;
+        const end = findMatchingBracket(clean, brace);
+        if (end === undefined || end > modelEndBrace) return undefined;
+        compatBrace = brace;
+        compatEndBrace = end;
       }
     }
 
@@ -6651,6 +7117,10 @@ function locateModelInJsonc(
     modelOverrideObjectEnd,
     modelOverrideCompatBrace,
     modelOverrideCompatEnd,
+    providerKeyCount: providerKey.count,
+    modelOverrideKeyCount: overrideLocation?.modelOverrideKeyCount ?? 0,
+    modelCompatKeyCount,
+    providerCompatKeyCount,
     allModelIds,
   };
 }
@@ -6680,8 +7150,9 @@ function analyzeModelsJsonForMissingEntry(
   if (clean[rootBrace] !== "{") return undefined;
 
   const providersKey = findJsonObjectKey(clean, rootBrace, "providers");
-  if (!providersKey) {
-    // Root has no "providers" key at all — we don't auto-create one.
+  if (!providersKey || providersKey.count !== 1) {
+    // Root has no unique "providers" key — we don't auto-create or guess
+    // among duplicate definitions.
     return undefined;
   }
   const providersBrace = skipJsonWhitespace(clean, providersKey.valueStart);
@@ -6690,9 +7161,10 @@ function analyzeModelsJsonForMissingEntry(
   if (providersEnd === undefined) return undefined;
 
   const providerKey = findJsonObjectKey(clean, providersBrace, providerLabel);
-  if (!providerKey || providerKey.keyStart > providersEnd) {
+  if (!providerKey) {
     return { scenario: "provider_missing", providersBrace, providersEnd };
   }
+  if (providerKey.count !== 1 || providerKey.keyStart > providersEnd) return undefined;
 
   // Provider exists. Check for a models array so we know where to append.
   const providerBrace = skipJsonWhitespace(clean, providerKey.valueStart);
@@ -6701,14 +7173,42 @@ function analyzeModelsJsonForMissingEntry(
   if (providerEndBrace === undefined || providerEndBrace > providersEnd) return undefined;
 
   const modelsKey = findJsonObjectKey(clean, providerBrace, "models");
+  if (modelsKey?.count && modelsKey.count > 1) return undefined;
   if (modelsKey && modelsKey.keyStart < providerEndBrace) {
-    let mScan = skipJsonWhitespace(clean, modelsKey.valueStart);
-    if (clean[mScan] === "[") {
-      const modelsEnd = findMatchingBracket(clean, mScan);
-      if (modelsEnd !== undefined && modelsEnd <= providerEndBrace) {
-        return { scenario: "model_missing", modelsEnd, providerBrace, providerEndBrace };
+    const mScan = skipJsonWhitespace(clean, modelsKey.valueStart);
+    if (clean[mScan] !== "[") return undefined;
+    const modelsEnd = findMatchingBracket(clean, mScan);
+    if (modelsEnd === undefined || modelsEnd > providerEndBrace) return undefined;
+
+    // Confirm that the target really is absent before offering an insertion.
+    // This second pass also refuses malformed/ambiguous existing entries, so
+    // a scanner failure can never turn into a duplicate model definition.
+    let modelScan = mScan + 1;
+    let targetFound = false;
+    while (modelScan < modelsEnd) {
+      modelScan = skipJsonWhitespace(clean, modelScan);
+      if (clean[modelScan] === ",") {
+        modelScan++;
+        continue;
       }
+      if (modelScan >= modelsEnd || clean[modelScan] === "]") break;
+      if (clean[modelScan] !== "{") return undefined;
+      const elementEnd = findMatchingBracket(clean, modelScan);
+      if (elementEnd === undefined || elementEnd > modelsEnd) return undefined;
+      const idKey = findJsonObjectKey(clean, modelScan, "id");
+      if (!idKey || idKey.count !== 1) return undefined;
+      const idStart = skipJsonWhitespace(clean, idKey.valueStart);
+      const idLiteral = readJsonStringLiteral(clean, idStart);
+      if (!idLiteral || idLiteral.end > elementEnd) return undefined;
+      if (idLiteral.value === modelId) {
+        targetFound = true;
+        const compatKey = findJsonObjectKey(clean, modelScan, "compat");
+        if (compatKey?.count && compatKey.count > 1) return undefined;
+      }
+      modelScan = elementEnd + 1;
     }
+    if (targetFound) return undefined;
+    return { scenario: "model_missing", modelsEnd, providerBrace, providerEndBrace };
   }
 
   // Provider exists, but there's no discoverable models array — treat as
@@ -6730,7 +7230,7 @@ function formatMissingEntryManualSnippet(
   const lines: string[] = [];
   const sorted = Object.entries(compatKeys).sort(([a], [b]) => a.localeCompare(b));
   const compatItems = sorted.map(([k, v]) => `          ${JSON.stringify(k)}: ${JSON.stringify(v)}`);
-  lines.push(`"${providerLabel}": {`);
+  lines.push(`${JSON.stringify(providerLabel)}: {`);
   lines.push(`    "modelOverrides": {`);
   lines.push(`      ${JSON.stringify(modelId)}: {`);
   lines.push(`        "compat": {`);
@@ -6757,6 +7257,7 @@ function composeModelOverrideInsertion(
 
   if (location?.modelOverrideObjectBrace !== undefined && location.modelOverrideObjectBrace >= 0) {
     const modelLocation: ModelNodeLocation = {
+      providerKeyCount: location.providerKeyCount,
       modelObjectBrace: -1,
       modelObjectEnd: -1,
       compatKeyStart: -1,
@@ -6771,6 +7272,9 @@ function composeModelOverrideInsertion(
       modelOverrideObjectEnd: location.modelOverrideObjectEnd,
       modelOverrideCompatBrace: location.modelOverrideCompatBrace,
       modelOverrideCompatEnd: location.modelOverrideCompatEnd,
+      modelOverrideKeyCount: location.modelOverrideKeyCount,
+      modelCompatKeyCount: 0,
+      providerCompatKeyCount: 0,
       allModelIds: [],
     };
     return {
@@ -7010,7 +7514,8 @@ function composeMissingEntryInsertion(
  * Lightweight self-check for a newly inserted model or modelOverrides entry.
  * Parses the modified text as JSONC and confirms:
  *   1. The target exists under models[] or modelOverrides.
- *   2. Every compat key has the expected effective three-layer value.
+ *   2. Every compat key has the expected effective provider/model/runtime/
+ *      modelOverride value.
  * Returns null on success, an error string on failure.
  */
 function selfCheckMissingEntryInsertion(
@@ -7019,6 +7524,7 @@ function selfCheckMissingEntryInsertion(
   providerLabel: string,
   modelId: string,
   compatKeys: Record<string, unknown>,
+  runtimeModel?: PiModel,
 ): string | null {
   try {
     const origParsed = parseJsonc(originalText);
@@ -7036,7 +7542,19 @@ function selfCheckMissingEntryInsertion(
       return `Modified file: model or modelOverrides entry "${modelId}" not found in provider after insertion`;
     }
 
+    const effectiveCompat = runtimeModel
+      ? resolveEffectiveCompatFromConfig(runtimeModel, modParsed)
+      : undefined;
     for (const [k, v] of Object.entries(compatKeys)) {
+      if (effectiveCompat) {
+        if (!Object.prototype.hasOwnProperty.call(effectiveCompat, k)) {
+          return `Modified file: effective compat.${k} not found`;
+        }
+        if ((effectiveCompat as Record<string, unknown>)[k] !== v) {
+          return `Modified file: effective compat.${k} wrong value: expected ${JSON.stringify(v)}, got ${JSON.stringify((effectiveCompat as Record<string, unknown>)[k])}`;
+        }
+        continue;
+      }
       const effective = resolveExplicitCompatValue(modParsed, providerLabel, modelId, k);
       if (!effective) return `Modified file: effective compat.${k} not found`;
       if (effective.value !== v) {
@@ -7218,8 +7736,10 @@ function decideFixPlacement(
       continue;
     }
     if (key === "thinkingFormat" || key === "requiresReasoningContentOnAssistantMessages") {
-      const allDeepSeek = siblings.every((id) => isDeepSeekLikeModel(syntheticModelForId(providerLabel, id)));
-      if (!allDeepSeek) unsafeKeys.push(key);
+      // Reasoning wire/replay behavior is model-specific. Sibling ids do not
+      // prove that they use the same protocol, so never broaden this repair to
+      // provider scope based on a shared DeepSeek name alone.
+      unsafeKeys.push(key);
       continue;
     }
     // Unknown model-behavior key — be conservative, keep it model-scoped.
@@ -7268,8 +7788,8 @@ function chooseFixPlacement(
 
   if (forceModelLevel) {
     return {
-      placement: "model",
-      reason: "runtime-observed provider/model failure — scoping the repair to the affected model",
+      placement: "modelOverride",
+      reason: "runtime-observed provider/model failure — using Pi's highest-precedence model override",
     };
   }
 
@@ -7419,6 +7939,7 @@ function selfCheckFix(
   modelId: string,
   compatKeys: Record<string, unknown>,
   placement: "provider" | "model" | "modelOverride" = "model",
+  runtimeModel?: PiModel,
 ): string | null {
   try {
     // Step 1: Parse both versions as JSONC (comments + trailing commas allowed).
@@ -7463,8 +7984,9 @@ function selfCheckFix(
     }
 
     // Step 5: Compute the EFFECTIVE merged compat using Pi's precedence:
-    // provider, custom model, then modelOverrides. The fix may have written any
-    // level, so validation must check what Pi will actually use.
+    // provider, custom model, runtime model, then modelOverrides. The fix may
+    // have written any persistent level, so validation must check what Pi will
+    // actually use.
     const provCompatRaw = (provider as Record<string, unknown>).compat;
     const provCompat = (provCompatRaw && typeof provCompatRaw === 'object' && !Array.isArray(provCompatRaw))
       ? provCompatRaw as Record<string, unknown>
@@ -7480,7 +8002,9 @@ function selfCheckFix(
       return `Modified file: modelOverrides["${modelId}"].compat is not an object`;
     }
     const overrideCompat = asRecord(overrideCompatRaw) ?? {};
-    const mergedCompat: Record<string, unknown> = { ...provCompat, ...mdlCompat, ...overrideCompat };
+    const mergedCompat: Record<string, unknown> = runtimeModel
+      ? resolveEffectiveCompatFromConfig(runtimeModel, modParsed) as Record<string, unknown>
+      : { ...provCompat, ...mdlCompat, ...overrideCompat };
 
     // Step 6: Validate all inserted keys are effective in the merged compat
     for (const [k, v] of Object.entries(compatKeys)) {
@@ -7492,62 +8016,97 @@ function selfCheckFix(
       }
     }
 
-    // Step 7: Validate original structure is preserved (no accidental deletions/changes)
+    // Step 7: Validate that the parsed document is unchanged except for the
+    // explicitly requested scalar keys in the compat object we edited. A
+    // one-way subset check is not sufficient here: it would accept accidental
+    // additions such as credentials or unrelated provider fields.
+    const editedCompatContainer = (value: Record<string, unknown>): boolean =>
+      (placement === "provider" && value === origProvider) ||
+      (placement === "model" && value === origTargetModelRecord) ||
+      (placement === "modelOverride" && value === asRecord(asRecord(origProvider.modelOverrides)?.[modelId]));
 
-    function isSubset(origVal: unknown, modVal: unknown, path = ''): boolean {
-      if (origVal === modVal) return true;
-      if (typeof origVal !== typeof modVal) return false;
-      if (typeof origVal !== 'object' || origVal === null || modVal === null) return false;
-      if (Array.isArray(origVal) !== Array.isArray(modVal)) return false;
-      if (Array.isArray(origVal) && Array.isArray(modVal)) {
-        if (origVal.length !== modVal.length) return false;
-        return origVal.every((_, i) => isSubset(origVal[i], modVal[i], `${path}[${i}]`));
+    function sameCompatObject(
+      originalCompatValue: unknown,
+      modifiedCompatValue: unknown,
+    ): boolean {
+      const originalCompat = originalCompatValue === undefined
+        ? {}
+        : asRecord(originalCompatValue);
+      const modifiedCompat = asRecord(modifiedCompatValue);
+      if (!originalCompat || !modifiedCompat) return false;
+
+      const allowedKeys = new Set([...Object.keys(originalCompat), ...Object.keys(compatKeys)]);
+      const modifiedKeys = Object.keys(modifiedCompat);
+      if (modifiedKeys.length !== allowedKeys.size || modifiedKeys.some((key) => !allowedKeys.has(key))) {
+        return false;
       }
-      // Both objects: check that every key in orig is in mod with same value
-      const origObj = origVal as Record<string, unknown>;
-      const modObj = modVal as Record<string, unknown>;
-      for (const key of Object.keys(origObj)) {
-        if (!(key in modObj)) return false;
-        if (key === 'compat') {
-          // For compat, allow extra keys in modified (the inserted ones).
-          // Use recursive isSubset so nested objects (e.g. { deep: true })
-          // are compared by content, not reference.
-          if (typeof origObj[key] !== 'object' || typeof modObj[key] !== 'object') {
-            if (origObj[key] !== modObj[key]) return false;
-          } else {
-            const origCompat = origObj[key] as Record<string, unknown>;
-            const modCompat = modObj[key] as Record<string, unknown>;
-            // Only the compat object at the level ACTUALLY edited may have
-            // its values repaired by this fix. The un-edited level must
-            // remain byte/structure-equivalent, so its same-name keys stay
-            // under full validation. Using a disjunction OR (provider ||
-            // target) here would silently skip validation at the un-edited
-            // level, masking corruption (e.g. a buggy editor accidentally
-            // breaking provider.compat.sendSessionAffinityHeaders while
-            // the fix was a model-level repair). Track placement — only
-            // the placement-resolved object's own compat may be exempt.
-            const mayRepairThisCompat =
-              (placement === "provider" && origObj === origProvider) ||
-              (placement === "model" && origObj === origTargetModelRecord) ||
-              (placement === "modelOverride" && origObj === asRecord(asRecord(origProvider.modelOverrides)?.[modelId]));
-            for (const ck of Object.keys(origCompat)) {
-              if (!(ck in modCompat)) return false;
-              // The fix may repair an existing wrong compat value (for example
-              // thinkingFormat: "legacy" -> "deepseek"), but only on the
-              // target provider/model compat objects. Sibling compat blocks must
-              // remain structure-equivalent.
-              if (mayRepairThisCompat && Object.prototype.hasOwnProperty.call(compatKeys, ck)) continue;
-              if (!isSubset(origCompat[ck], modCompat[ck], `${path}.${ck}`)) return false;
-            }
+
+      for (const key of allowedKeys) {
+        if (Object.prototype.hasOwnProperty.call(compatKeys, key)) {
+          if (!Object.prototype.hasOwnProperty.call(modifiedCompat, key) || modifiedCompat[key] !== compatKeys[key]) {
+            return false;
           }
-        } else if (!isSubset(origObj[key], modObj[key], `${path}.${key}`)) {
+          continue;
+        }
+        if (!Object.prototype.hasOwnProperty.call(originalCompat, key) ||
+            !sameDocumentValue(originalCompat[key], modifiedCompat[key])) {
           return false;
         }
       }
       return true;
     }
 
-    if (!isSubset(origParsed, modParsed)) {
+    function sameDocumentValue(originalValue: unknown, modifiedValue: unknown): boolean {
+      if (originalValue === modifiedValue) return true;
+      if (typeof originalValue !== typeof modifiedValue || originalValue === null || modifiedValue === null) return false;
+      if (Array.isArray(originalValue) || Array.isArray(modifiedValue)) {
+        if (!Array.isArray(originalValue) || !Array.isArray(modifiedValue) || originalValue.length !== modifiedValue.length) return false;
+        return originalValue.every((value, index) => sameDocumentValue(value, modifiedValue[index]));
+      }
+      if (typeof originalValue !== "object") return false;
+
+      const originalObject = originalValue as Record<string, unknown>;
+      const modifiedObject = modifiedValue as Record<string, unknown>;
+      const originalKeys = Object.keys(originalObject);
+      const modifiedKeys = Object.keys(modifiedObject);
+      if (originalKeys.length !== modifiedKeys.length || modifiedKeys.some((key) => !Object.prototype.hasOwnProperty.call(originalObject, key))) {
+        return false;
+      }
+      return originalKeys.every((key) => sameDocumentValue(originalObject[key], modifiedObject[key]));
+    }
+
+    function sameDocumentExceptEditedCompat(originalValue: unknown, modifiedValue: unknown): boolean {
+      if (originalValue === modifiedValue) return true;
+      if (typeof originalValue !== typeof modifiedValue || originalValue === null || modifiedValue === null) return false;
+      if (Array.isArray(originalValue) || Array.isArray(modifiedValue)) {
+        if (!Array.isArray(originalValue) || !Array.isArray(modifiedValue) || originalValue.length !== modifiedValue.length) return false;
+        return originalValue.every((value, index) => sameDocumentExceptEditedCompat(value, modifiedValue[index]));
+      }
+      if (typeof originalValue !== "object") return false;
+
+      const originalObject = originalValue as Record<string, unknown>;
+      const modifiedObject = modifiedValue as Record<string, unknown>;
+      if (editedCompatContainer(originalObject)) {
+        const originalKeys = Object.keys(originalObject).filter((key) => key !== "compat");
+        const modifiedKeys = Object.keys(modifiedObject).filter((key) => key !== "compat");
+        if (originalKeys.length !== modifiedKeys.length || modifiedKeys.some((key) => !Object.prototype.hasOwnProperty.call(originalObject, key))) {
+          return false;
+        }
+        for (const key of originalKeys) {
+          if (!sameDocumentExceptEditedCompat(originalObject[key], modifiedObject[key])) return false;
+        }
+        return sameCompatObject(originalObject.compat, modifiedObject.compat);
+      }
+
+      const originalKeys = Object.keys(originalObject);
+      const modifiedKeys = Object.keys(modifiedObject);
+      if (originalKeys.length !== modifiedKeys.length || modifiedKeys.some((key) => !Object.prototype.hasOwnProperty.call(originalObject, key))) {
+        return false;
+      }
+      return originalKeys.every((key) => sameDocumentExceptEditedCompat(originalObject[key], modifiedObject[key]));
+    }
+
+    if (!sameDocumentExceptEditedCompat(origParsed, modParsed)) {
       return "Modified file: original structure was altered (data loss detected)";
     }
 
@@ -7611,16 +8170,78 @@ function uniqueTempPath(targetPath: string, purpose: string): string {
   return `${targetPath}.${process.pid}.${Date.now()}.${backupSequence++}.${purpose}.tmp`;
 }
 
+type FileIdentity = { dev: number | bigint; ino: number | bigint };
+
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  // Some platforms do not expose a meaningful inode. On those platforms the
+  // hash checks around the transaction remain authoritative.
+  const leftDev = Number(left.dev);
+  const rightDev = Number(right.dev);
+  const leftIno = Number(left.ino);
+  const rightIno = Number(right.ino);
+  return leftIno === 0 || rightIno === 0 || (leftDev === rightDev && leftIno === rightIno);
+}
+
+type AtomicTargetGuard = {
+  identity?: FileIdentity;
+  hash?: string;
+  mode?: number;
+};
+
+async function validateAtomicTarget(
+  targetPath: string,
+  guard?: AtomicTargetGuard,
+): Promise<Awaited<ReturnType<typeof lstat>>> {
+  const info = await lstat(targetPath);
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new Error("target is not a regular file; refusing atomic replacement");
+  }
+  if (guard?.identity && !sameFileIdentity(guard.identity, info)) {
+    throw new Error("target changed during atomic replacement");
+  }
+  if (guard?.mode !== undefined && (info.mode & 0o7777) !== guard.mode) {
+    throw new Error("target access mode changed during atomic replacement");
+  }
+  if (guard?.hash !== undefined) {
+    const text = await readFile(targetPath, "utf8");
+    if (hashText(text) !== guard.hash) {
+      throw new Error("target content changed during atomic replacement");
+    }
+  }
+  return info;
+}
+
 async function atomicReplaceTextFilePreservingMode(
   targetPath: string,
   content: string,
   mode: number,
   purpose: string,
+  guard?: AtomicTargetGuard,
+  /** Test-only race injector; production callers leave this undefined. */
+  beforeRename?: () => Promise<void>,
 ): Promise<void> {
+  const initialTargetInfo = await validateAtomicTarget(targetPath, guard);
   const tempPath = uniqueTempPath(targetPath, purpose);
   try {
-    await writeFile(tempPath, content, { encoding: "utf8", mode });
+    // `wx` makes the unique temporary path non-overwriting even if a hostile
+    // or stale file appears between name generation and the write.
+    await writeFile(tempPath, content, { encoding: "utf8", mode, flag: "wx" });
+    const tempInfo = await lstat(tempPath);
+    if (tempInfo.isSymbolicLink() || !tempInfo.isFile()) {
+      throw new Error("temporary replacement is not a regular file");
+    }
     await chmod(tempPath, mode);
+    await validateAtomicTarget(targetPath, {
+      ...guard,
+      identity: initialTargetInfo,
+      mode,
+    });
+    if (beforeRename) await beforeRename();
+    await validateAtomicTarget(targetPath, {
+      ...guard,
+      identity: initialTargetInfo,
+      mode,
+    });
     await rename(tempPath, targetPath);
   } catch (error) {
     try {
@@ -7638,11 +8259,42 @@ async function atomicRestoreFileFromBackup(
   backupPath: string,
   targetPath: string,
   mode: number,
+  guard?: AtomicTargetGuard & { backupHash?: string },
+  /** Test-only race injector; production callers leave this undefined. */
+  beforeRename?: () => Promise<void>,
 ): Promise<void> {
+  const backupInfo = await lstat(backupPath);
+  if (backupInfo.isSymbolicLink() || !backupInfo.isFile()) {
+    throw new Error("backup is not a regular file; refusing atomic restore");
+  }
+  if (guard?.backupHash !== undefined) {
+    const backupText = await readFile(backupPath, "utf8");
+    if (hashText(backupText) !== guard.backupHash) {
+      throw new Error("backup content changed during atomic restore");
+    }
+  }
+  const targetInfo = await validateAtomicTarget(targetPath, guard);
   const tempPath = uniqueTempPath(targetPath, "restore");
   try {
     await copyFile(backupPath, tempPath, fsConstants.COPYFILE_EXCL);
+    const tempInfo = await lstat(tempPath);
+    if (tempInfo.isSymbolicLink() || !tempInfo.isFile()) {
+      throw new Error("temporary restore is not a regular file");
+    }
     await chmod(tempPath, mode);
+    const tempText = await readFile(tempPath, "utf8");
+    if (guard?.backupHash !== undefined && hashText(tempText) !== guard.backupHash) {
+      throw new Error("backup content changed during atomic restore");
+    }
+    await validateAtomicTarget(targetPath, {
+      ...guard,
+      identity: targetInfo,
+    });
+    if (beforeRename) await beforeRename();
+    await validateAtomicTarget(targetPath, {
+      ...guard,
+      identity: targetInfo,
+    });
     await rename(tempPath, targetPath);
   } catch (error) {
     try {
@@ -7660,43 +8312,285 @@ type ModelsJsonFixTransactionResult =
   | { ok: true }
   | { ok: false; postCheckError: string };
 
-async function applyModelsJsonFixTransaction(
+type ModelsJsonFixReceiptSnapshot = {
+  receipt: ModelsJsonFixReceiptV1;
+  receiptPath: string;
+  hash: string;
+  identity: FileIdentity;
+};
+
+type ModelsJsonFixTransactionOptions = {
+  onCommitted?: (writtenText: string) => Promise<void>;
+  expectedCurrentHash?: string;
+  /** Access mode captured by a preview, used to reject mode races. */
+  expectedCurrentMode?: number;
+  /** Hash of the transaction backup, used to revalidate a guarded restore. */
+  expectedBackupHash?: string;
+  /** Receipt identity captured before a rollback preview. */
+  receiptGuard?: ModelsJsonFixReceiptSnapshot;
+  purpose?: string;
+};
+
+function hashText(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+async function withModelsJsonTransactionLock<T>(operation: () => Promise<T>): Promise<T> {
+  await mkdir(STATE_DIR, { recursive: true });
+  const deadline = Date.now() + MODELS_TRANSACTION_LOCK_WAIT_MS;
+  const ownerToken = randomUUID();
+  const ownerText = JSON.stringify({ pid: process.pid, token: ownerToken });
+  let ownedLockIdentity: FileIdentity | undefined;
+  while (true) {
+    try {
+      // A single O_EXCL file is the lease: unlike mkdir-then-owner-file, there
+      // is no ownerless crash window between creating the lock and identifying
+      // its owner.
+      await writeFile(MODELS_TRANSACTION_LOCK_PATH, ownerText, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      const lockInfo = await lstat(MODELS_TRANSACTION_LOCK_PATH);
+      if (lockInfo.isSymbolicLink() || !lockInfo.isFile()) {
+        throw new Error("models.json transaction lock path is unsafe");
+      }
+      ownedLockIdentity = lockInfo;
+      break;
+    } catch (error) {
+      if (getErrorCode(error) !== "EEXIST") throw error;
+      const lockInfo = await lstat(MODELS_TRANSACTION_LOCK_PATH).catch(() => undefined);
+      if (!lockInfo) continue;
+      if (lockInfo.isSymbolicLink() || !lockInfo.isFile()) {
+        throw new Error("models.json transaction lock path is unsafe");
+      }
+      let staleOwnerPid: number | undefined;
+      try {
+        const owner = asRecord(JSON.parse(await readFile(MODELS_TRANSACTION_LOCK_PATH, "utf8")));
+        if (typeof owner?.pid === "number") staleOwnerPid = owner.pid;
+      } catch {}
+      const stale = Date.now() - lockInfo.mtimeMs > MODELS_TRANSACTION_LOCK_STALE_MS;
+      if (stale && (staleOwnerPid === undefined || !isProcessAlive(staleOwnerPid))) {
+        // Recheck identity immediately before unlinking so a recovered owner
+        // cannot delete a replacement lease created at the same path.
+        const currentLock = await lstat(MODELS_TRANSACTION_LOCK_PATH).catch(() => undefined);
+        if (currentLock && sameFileIdentity(lockInfo, currentLock)) {
+          await unlink(MODELS_TRANSACTION_LOCK_PATH).catch((unlinkError) => {
+            if (getErrorCode(unlinkError) !== "ENOENT") throw unlinkError;
+          });
+        }
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error("another cache-optimizer models.json transaction is still running");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  try {
+    return await operation();
+  } finally {
+    // Only the matching inode and owner token may remove the lease. A
+    // recovered/replaced lock belongs to another transaction.
+    try {
+      const currentLock = await lstat(MODELS_TRANSACTION_LOCK_PATH);
+      if (
+        ownedLockIdentity &&
+        !currentLock.isSymbolicLink() &&
+        currentLock.isFile() &&
+        sameFileIdentity(ownedLockIdentity, currentLock) &&
+        await readFile(MODELS_TRANSACTION_LOCK_PATH, "utf8") === ownerText
+      ) {
+        await unlink(MODELS_TRANSACTION_LOCK_PATH);
+      }
+    } catch (error) {
+      if (getErrorCode(error) !== "ENOENT") {
+        console.warn(`${LOG_PREFIX}: failed to remove models.json transaction lock`, error);
+      }
+    }
+  }
+}
+
+async function assertModelsJsonFixReceiptSnapshotUnchanged(
+  snapshot: ModelsJsonFixReceiptSnapshot,
+): Promise<void> {
+  const info = await lstat(snapshot.receiptPath);
+  if (
+    info.isSymbolicLink() ||
+    !info.isFile() ||
+    !sameFileIdentity(snapshot.identity, info)
+  ) {
+    throw new Error("fix receipt changed since the rollback preview");
+  }
+  const text = await readFile(snapshot.receiptPath, "utf8");
+  const afterRead = await lstat(snapshot.receiptPath);
+  if (
+    afterRead.isSymbolicLink() ||
+    !afterRead.isFile() ||
+    !sameFileIdentity(info, afterRead) ||
+    hashText(text) !== snapshot.hash
+  ) {
+    throw new Error("fix receipt changed since the rollback preview");
+  }
+}
+
+async function applyModelsJsonFixTransactionUnderLock(
   modifiedText: string,
   backupPath: string,
   validateWrittenText: (writtenText: string) => string | null,
+  options: ModelsJsonFixTransactionOptions = {},
 ): Promise<ModelsJsonFixTransactionResult> {
-  const originalMode = (await stat(MODELS_JSON_PATH)).mode & 0o7777;
-  await copyFile(MODELS_JSON_PATH, backupPath, fsConstants.COPYFILE_EXCL);
-  await chmod(backupPath, originalMode);
+  if (options.receiptGuard) {
+    await assertModelsJsonFixReceiptSnapshotUnchanged(options.receiptGuard);
+  }
+  const targetInfo = await lstat(MODELS_JSON_PATH);
+  if (!targetInfo.isFile() || targetInfo.isSymbolicLink()) {
+    throw new Error("models.json is not a regular file; no changes were made");
+  }
+  const originalMode = targetInfo.mode & 0o7777;
+  const transactionName = options.purpose === "rollback" ? "rollback" : "fix";
+  if (options.expectedCurrentMode !== undefined && options.expectedCurrentMode !== originalMode) {
+    throw new Error(`models.json access mode changed since the ${transactionName} preview; no changes were made`);
+  }
+  const initialTargetText = await readFile(MODELS_JSON_PATH, "utf8");
+  const transactionInitialHash = hashText(initialTargetText);
+  const expectedCurrentHash = options.expectedCurrentHash ?? transactionInitialHash;
+  const expectedBackupHash = options.expectedBackupHash ?? expectedCurrentHash;
+  const assertCurrentTargetUnchanged = async (): Promise<void> => {
+    const currentInfo = await lstat(MODELS_JSON_PATH);
+    if (
+      currentInfo.isSymbolicLink() ||
+      !currentInfo.isFile() ||
+      !sameFileIdentity(targetInfo, currentInfo) ||
+      (currentInfo.mode & 0o7777) !== originalMode
+    ) {
+      throw new Error(`models.json changed during ${transactionName}; no changes were made`);
+    }
+    const currentText = await readFile(MODELS_JSON_PATH, "utf8");
+    if (hashText(currentText) !== expectedCurrentHash) {
+      throw new Error(`models.json changed since the ${transactionName} preview; no changes were made`);
+    }
+  };
+  const assertBackupUnchanged = async (): Promise<void> => {
+    const backupInfo = await lstat(backupPath);
+    if (backupInfo.isSymbolicLink() || !backupInfo.isFile()) {
+      throw new Error(`models.json ${transactionName} backup is not a regular file; no changes were made`);
+    }
+    if (expectedBackupHash !== undefined) {
+      const backupText = await readFile(backupPath, "utf8");
+      if (hashText(backupText) !== expectedBackupHash) {
+        throw new Error(`models.json ${transactionName} backup changed during preparation; no changes were made`);
+      }
+    }
+  };
 
+  await assertCurrentTargetUnchanged();
+  await copyFile(MODELS_JSON_PATH, backupPath, fsConstants.COPYFILE_EXCL);
+  const createdBackupInfo = await lstat(backupPath);
+  if (createdBackupInfo.isSymbolicLink() || !createdBackupInfo.isFile()) {
+    throw new Error(`models.json ${transactionName} backup is not a regular file; no changes were made`);
+  }
+  await chmod(backupPath, originalMode);
+  const chmodBackupInfo = await lstat(backupPath);
+  if (
+    chmodBackupInfo.isSymbolicLink() ||
+    !chmodBackupInfo.isFile() ||
+    !sameFileIdentity(createdBackupInfo, chmodBackupInfo)
+  ) {
+    throw new Error(`models.json ${transactionName} backup changed during preparation; no changes were made`);
+  }
+  await assertBackupUnchanged();
+
+  const expectedModifiedHash = hashText(modifiedText);
   let targetReplaced = false;
+  const restoreTargetIfUnchanged = async (): Promise<void> => {
+    const currentInfo = await lstat(MODELS_JSON_PATH);
+    if (
+      currentInfo.isSymbolicLink() ||
+      !currentInfo.isFile() ||
+      (currentInfo.mode & 0o7777) !== originalMode
+    ) {
+      throw new Error(`models.json changed after ${transactionName} replacement; refusing to overwrite user changes`);
+    }
+    const currentText = await readFile(MODELS_JSON_PATH, "utf8");
+    if (hashText(currentText) !== expectedModifiedHash) {
+      throw new Error(`models.json changed after ${transactionName} replacement; refusing to overwrite user changes`);
+    }
+    await assertBackupUnchanged();
+    await atomicRestoreFileFromBackup(backupPath, MODELS_JSON_PATH, originalMode, {
+      identity: currentInfo,
+      hash: expectedModifiedHash,
+      mode: originalMode,
+      backupHash: expectedBackupHash,
+    });
+    const restoredInfo = await lstat(MODELS_JSON_PATH);
+    if (restoredInfo.isSymbolicLink() || !restoredInfo.isFile()) {
+      throw new Error(`models.json restore produced a non-regular file`);
+    }
+    const restoredText = await readFile(MODELS_JSON_PATH, "utf8");
+    if (expectedBackupHash !== undefined && hashText(restoredText) !== expectedBackupHash) {
+      throw new Error(`models.json restore did not match the transaction backup`);
+    }
+  };
+
   try {
+    await assertCurrentTargetUnchanged();
     await atomicReplaceTextFilePreservingMode(
       MODELS_JSON_PATH,
       modifiedText,
       originalMode,
-      "fix",
+      options.purpose ?? "fix",
+      {
+        identity: targetInfo,
+        hash: expectedCurrentHash,
+        mode: originalMode,
+      },
     );
     targetReplaced = true;
 
+    const writtenInfo = await lstat(MODELS_JSON_PATH);
+    if (writtenInfo.isSymbolicLink() || !writtenInfo.isFile()) {
+      throw new Error(`models.json became a non-regular file during ${transactionName} replacement`);
+    }
     const writtenText = await readFile(MODELS_JSON_PATH, "utf8");
     const postCheckError = validateWrittenText(writtenText);
-    const writtenMode = (await stat(MODELS_JSON_PATH)).mode & 0o7777;
-    const effectiveError = postCheckError ?? (
-      writtenMode === originalMode
-        ? null
-        : `models.json access mode changed from ${originalMode.toString(8)} to ${writtenMode.toString(8)}`
-    );
+    const writtenMode = writtenInfo.mode & 0o7777;
+    const writeHashError = hashText(writtenText) === expectedModifiedHash
+      ? null
+      : `models.json changed during ${transactionName} replacement`;
+    const modeError = writtenMode === originalMode
+      ? null
+      : `models.json access mode changed from ${originalMode.toString(8)} to ${writtenMode.toString(8)}`;
+    const effectiveError = postCheckError ?? writeHashError ?? modeError;
     if (effectiveError !== null) {
-      await atomicRestoreFileFromBackup(backupPath, MODELS_JSON_PATH, originalMode);
+      await restoreTargetIfUnchanged();
+      targetReplaced = false;
       return { ok: false, postCheckError: effectiveError };
     }
 
+    // Re-check immediately before committing receipt metadata. If a caller
+    // changed the replacement after validation, do not mark the transaction
+    // successful and do not restore over that caller's change.
+    await validateAtomicTarget(MODELS_JSON_PATH, {
+      identity: writtenInfo,
+      hash: expectedModifiedHash,
+      mode: originalMode,
+    });
+
+    // A receipt is part of a successful fix transaction. If its atomic write
+    // fails, the catch path restores the models file from the transaction
+    // backup instead of leaving an un-recoverable configuration change.
+    if (options.receiptGuard) {
+      await assertModelsJsonFixReceiptSnapshotUnchanged(options.receiptGuard);
+    }
+    await options.onCommitted?.(writtenText);
     return { ok: true };
   } catch (error) {
     if (targetReplaced) {
       try {
-        await atomicRestoreFileFromBackup(backupPath, MODELS_JSON_PATH, originalMode);
+        await restoreTargetIfUnchanged();
+        targetReplaced = false;
       } catch (restoreError) {
         throw new AggregateError(
           [error, restoreError],
@@ -7706,6 +8600,630 @@ async function applyModelsJsonFixTransaction(
     }
     throw error;
   }
+}
+
+async function applyModelsJsonFixTransaction(
+  modifiedText: string,
+  backupPath: string,
+  validateWrittenText: (writtenText: string) => string | null,
+  options: ModelsJsonFixTransactionOptions = {},
+): Promise<ModelsJsonFixTransactionResult> {
+  return withModelsJsonTransactionLock(() =>
+    applyModelsJsonFixTransactionUnderLock(modifiedText, backupPath, validateWrittenText, options)
+  );
+}
+
+function isReceiptScalar(value: unknown): value is ReceiptScalar {
+  return value === null || typeof value === "string" || typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value));
+}
+
+function isReceiptScalarState(value: unknown): value is ReceiptScalarState {
+  const record = asRecord(value);
+  if (!record || record.present === undefined) return false;
+  if (record.present === false) return Object.keys(record).every((key) => key === "present");
+  return record.present === true && isReceiptScalar(record.value) && Object.keys(record).every((key) => key === "present" || key === "value");
+}
+
+function sameReceiptScalarState(left: ReceiptScalarState, right: ReceiptScalarState): boolean {
+  if (left.present !== right.present) return false;
+  return !left.present || left.value === (right as { present: true; value: ReceiptScalar }).value;
+}
+
+function isFixReceiptPlacement(value: unknown): value is FixReceiptPlacement {
+  return value === "provider" || value === "model" || value === "modelOverride";
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/i.test(value);
+}
+
+function hasReceiptReasoningProtocolChange(receipt: ModelsJsonFixReceiptV1): boolean {
+  return [
+    "thinkingFormat",
+    "supportsReasoningEffort",
+    "requiresReasoningContentOnAssistantMessages",
+  ].some((key) => Object.prototype.hasOwnProperty.call(receipt.changedKeys, key));
+}
+
+function isActionableModelsJsonFixReceipt(receipt: ModelsJsonFixReceiptV1 | undefined): receipt is ModelsJsonFixReceiptV1 {
+  return receipt !== undefined && receipt.status === undefined;
+}
+
+function createRollbackBackupPath(modelsPath: string = MODELS_JSON_PATH): string {
+  return `${modelsPath}.backup-cache-optimizer-rollback-${backupTimestamp()}`;
+}
+
+function isSafeReceiptText(value: unknown): value is string {
+  return isNonEmptyString(value) && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function isReceiptTimestamp(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV1 | undefined {
+  const record = asRecord(value);
+  if (!record || record.version !== 1 || record.kind !== "pi-cache-optimizer-fix-receipt") return undefined;
+  const allowedKeys = new Set([
+    "version", "kind", "transactionId", "provider", "modelId", "placement",
+    "targetExistedBefore", "changedKeys", "beforeHash", "afterHash", "backupFile",
+    "createdAt", "appliedAt", "status", "rolledBackAt",
+  ]);
+  if (Object.keys(record).some((key) => !allowedKeys.has(key))) return undefined;
+  if (!isSafeReceiptText(record.transactionId) || !isSafeReceiptText(record.provider) || !isSafeReceiptText(record.modelId)) return undefined;
+  if (!isFixReceiptPlacement(record.placement) || typeof record.targetExistedBefore !== "boolean") return undefined;
+  if (!isSha256(record.beforeHash) || !isSha256(record.afterHash) || record.beforeHash === record.afterHash) return undefined;
+  if (!isSafeReceiptText(record.backupFile) || basename(record.backupFile) !== record.backupFile || record.backupFile.includes("..")) return undefined;
+  if (!/^models\.json\.backup-cache-optimizer-/.test(record.backupFile)) return undefined;
+  const beforeHash = typeof record.beforeHash === "string" ? record.beforeHash.toLowerCase() : "";
+  const afterHash = typeof record.afterHash === "string" ? record.afterHash.toLowerCase() : "";
+  if (beforeHash === afterHash) return undefined;
+  if (!isReceiptTimestamp(record.createdAt) || !isReceiptTimestamp(record.appliedAt) || record.appliedAt < record.createdAt) return undefined;
+  const changedKeys = asRecord(record.changedKeys);
+  if (!changedKeys || Object.keys(changedKeys).length === 0) return undefined;
+
+  const parsedChanges: Record<string, FixReceiptCompatChange> = {};
+  for (const [key, rawChange] of Object.entries(changedKeys)) {
+    if (!RECEIPT_COMPAT_KEYS.has(key)) return undefined;
+    const change = asRecord(rawChange);
+    if (!change || !isReceiptScalarState(change.before) || !isReceiptScalarState(change.after)) return undefined;
+    if (sameReceiptScalarState(change.before, change.after)) return undefined;
+    parsedChanges[key] = {
+      before: change.before,
+      after: change.after,
+    };
+  }
+
+  if (record.status !== undefined && record.status !== "rolled_back") return undefined;
+  if (record.status === "rolled_back" && (!isReceiptTimestamp(record.rolledBackAt) || record.rolledBackAt < record.appliedAt)) return undefined;
+  if (record.status === undefined && record.rolledBackAt !== undefined) return undefined;
+
+  return {
+    version: 1,
+    kind: "pi-cache-optimizer-fix-receipt",
+    transactionId: record.transactionId.trim(),
+    provider: record.provider.trim(),
+    modelId: record.modelId.trim(),
+    placement: record.placement,
+    targetExistedBefore: record.targetExistedBefore,
+    changedKeys: parsedChanges,
+    beforeHash,
+    afterHash,
+    backupFile: record.backupFile,
+    createdAt: Number(record.createdAt),
+    appliedAt: Number(record.appliedAt),
+    ...(record.status === "rolled_back" ? { status: "rolled_back", rolledBackAt: Number(record.rolledBackAt) } : {}),
+  };
+}
+
+function receiptBackupPath(receipt: ModelsJsonFixReceiptV1, receiptPath: string = FIX_RECEIPT_PATH): string {
+  return join(dirname(receiptPath), receipt.backupFile);
+}
+
+async function writeModelsJsonFixReceipt(
+  receipt: ModelsJsonFixReceiptV1,
+  receiptPath: string = FIX_RECEIPT_PATH,
+  expectedSnapshot?: ModelsJsonFixReceiptSnapshot,
+  /** Test-only race injector; production callers leave this undefined. */
+  beforeRename?: () => Promise<void>,
+): Promise<void> {
+  if (!parseModelsJsonFixReceipt(receipt)) throw new Error("invalid fix receipt");
+  if (expectedSnapshot) {
+    if (expectedSnapshot.receiptPath !== receiptPath) throw new Error("fix receipt path changed since the rollback preview");
+    await assertModelsJsonFixReceiptSnapshotUnchanged(expectedSnapshot);
+  }
+  await mkdir(dirname(receiptPath), { recursive: true });
+  let existingReceiptInfo: { dev: number; ino: number } | undefined;
+  try {
+    const info = await lstat(receiptPath);
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error("invalid fix receipt path");
+    existingReceiptInfo = info;
+  } catch (error) {
+    if (getErrorCode(error) !== "ENOENT") throw error;
+  }
+  const mode = 0o600;
+
+  const tempPath = uniqueTempPath(receiptPath, "receipt");
+  try {
+    await writeFile(tempPath, JSON.stringify(receipt, null, 2) + "\n", { encoding: "utf8", mode, flag: "wx" });
+    const tempInfo = await lstat(tempPath);
+    if (tempInfo.isSymbolicLink() || !tempInfo.isFile()) throw new Error("invalid temporary fix receipt");
+    await chmod(tempPath, mode);
+    if (expectedSnapshot) {
+      await assertModelsJsonFixReceiptSnapshotUnchanged(expectedSnapshot);
+    }
+    const assertReceiptDestinationUnchanged = async (): Promise<void> => {
+      try {
+        const currentReceiptInfo = await lstat(receiptPath);
+        if (!existingReceiptInfo || !sameFileIdentity(existingReceiptInfo, currentReceiptInfo)) {
+          throw new Error("fix receipt changed during atomic write");
+        }
+      } catch (error) {
+        if (getErrorCode(error) === "ENOENT" && !existingReceiptInfo) {
+          // The destination was absent both before and immediately before the
+          // rename. The atomic rename will create it safely.
+        } else {
+          throw error;
+        }
+      }
+      if (expectedSnapshot) await assertModelsJsonFixReceiptSnapshotUnchanged(expectedSnapshot);
+    };
+    await assertReceiptDestinationUnchanged();
+    if (beforeRename) await beforeRename();
+    await assertReceiptDestinationUnchanged();
+    await rename(tempPath, receiptPath);
+  } catch (error) {
+    try {
+      await unlink(tempPath);
+    } catch (cleanupError) {
+      if (getErrorCode(cleanupError) !== "ENOENT") console.warn(`${LOG_PREFIX}: failed to remove temporary fix receipt`, cleanupError);
+    }
+    throw error;
+  }
+}
+
+async function readModelsJsonFixReceiptSnapshot(
+  receiptPath: string = FIX_RECEIPT_PATH,
+): Promise<ModelsJsonFixReceiptSnapshot | undefined> {
+  try {
+    const info = await lstat(receiptPath);
+    if (info.isSymbolicLink() || !info.isFile()) return undefined;
+    const text = await readFile(receiptPath, "utf8");
+    const afterRead = await lstat(receiptPath);
+    if (
+      afterRead.isSymbolicLink() ||
+      !afterRead.isFile() ||
+      !sameFileIdentity(info, afterRead)
+    ) return undefined;
+    const receipt = parseModelsJsonFixReceipt(JSON.parse(text));
+    if (!receipt) return undefined;
+    return {
+      receipt,
+      receiptPath,
+      hash: hashText(text),
+      identity: afterRead,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function readModelsJsonFixReceipt(
+  receiptPath: string = FIX_RECEIPT_PATH,
+): Promise<ModelsJsonFixReceiptV1 | undefined> {
+  return (await readModelsJsonFixReceiptSnapshot(receiptPath))?.receipt;
+}
+
+async function markModelsJsonFixReceiptRolledBack(
+  snapshot: ModelsJsonFixReceiptSnapshot,
+): Promise<void> {
+  const receipt = snapshot.receipt;
+  await writeModelsJsonFixReceipt({
+    ...receipt,
+    status: "rolled_back",
+    rolledBackAt: Date.now(),
+  }, snapshot.receiptPath, snapshot);
+}
+
+type ReceiptCompatTarget = {
+  targetExists: boolean;
+  compatBrace: number;
+  compatEnd: number;
+};
+
+function locateReceiptCompatTarget(
+  text: string,
+  provider: string,
+  modelId: string,
+  placement: FixReceiptPlacement,
+): ReceiptCompatTarget | undefined {
+  if (placement === "modelOverride") {
+    const location = locateModelOverrideInJsonc(text, provider, modelId);
+    if (
+      !location ||
+      location.providerKeyCount !== 1 ||
+      location.modelOverridesKeyCount > 1 ||
+      location.modelOverrideKeyCount > 1 ||
+      location.modelOverrideCompatKeyCount > 1
+    ) return undefined;
+    return {
+      targetExists: location.modelOverrideObjectBrace >= 0,
+      compatBrace: location.modelOverrideCompatBrace,
+      compatEnd: location.modelOverrideCompatEnd,
+    };
+  }
+
+  const location = locateModelInJsonc(text, provider, modelId);
+  if (!location || location.providerKeyCount !== 1) return undefined;
+  // A changed-file surgical rollback cannot tell which duplicate model object
+  // was the receipt's target. Refuse that ambiguity instead of touching a
+  // later user-added definition. Provider-level changes do not need to inspect
+  // model compat, but duplicate target ids still make the receipt identity
+  // ambiguous and are rejected for both placements.
+  if (location.allModelIds.filter((id) => id === modelId).length !== 1) return undefined;
+  if (placement === "provider" && location.providerCompatKeyCount > 1) return undefined;
+  if (placement === "model" && location.modelCompatKeyCount > 1) return undefined;
+  return {
+    targetExists: location.modelObjectBrace >= 0,
+    compatBrace: placement === "provider" ? location.providerCompatBrace : location.compatObjectBrace,
+    compatEnd: placement === "provider" ? location.providerCompatEnd : location.compatObjectEnd,
+  };
+}
+
+function readReceiptCompatScalarState(
+  text: string,
+  target: ReceiptCompatTarget | undefined,
+  key: string,
+): ReceiptScalarState | undefined {
+  if (!target || target.compatBrace < 0 || target.compatEnd <= target.compatBrace) {
+    return { present: false };
+  }
+  const clean = stripJsoncComments(text);
+  const property = findJsonObjectKey(clean, target.compatBrace, key);
+  if (!property || property.keyStart >= target.compatEnd) return { present: false };
+  if (property.count !== 1) return undefined;
+  const valueStart = skipJsonWhitespace(clean, property.valueStart);
+  const valueEnd = skipJsonValue(clean, valueStart);
+  if (valueEnd === undefined || valueEnd > target.compatEnd) return undefined;
+  try {
+    const value = parseJsonc(text.slice(valueStart, valueEnd));
+    return isReceiptScalar(value) ? { present: true, value } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function createModelsJsonFixReceipt(
+  originalText: string,
+  modifiedText: string,
+  provider: string,
+  modelId: string,
+  placement: FixReceiptPlacement,
+  compatKeys: Record<string, unknown>,
+  targetExistedBefore: boolean,
+  backupPath: string,
+  now: number = Date.now(),
+): ModelsJsonFixReceiptV1 | undefined {
+  const backupFile = basename(backupPath);
+  if (!/^models\.json\.backup-cache-optimizer-/.test(backupFile)) return undefined;
+  const beforeTarget = locateReceiptCompatTarget(originalText, provider, modelId, placement);
+  const afterTarget = locateReceiptCompatTarget(modifiedText, provider, modelId, placement);
+  if (targetExistedBefore && !beforeTarget?.targetExists) return undefined;
+  if (!afterTarget?.targetExists) return undefined;
+
+  const changedKeys: Record<string, FixReceiptCompatChange> = {};
+  for (const [key, afterValue] of Object.entries(compatKeys)) {
+    if (!isReceiptScalar(afterValue)) return undefined;
+    const before = readReceiptCompatScalarState(originalText, beforeTarget, key);
+    const after = readReceiptCompatScalarState(modifiedText, afterTarget, key);
+    if (!before || !after || !sameReceiptScalarState(after, { present: true, value: afterValue })) return undefined;
+    if (!sameReceiptScalarState(before, after)) changedKeys[key] = { before, after };
+  }
+  if (Object.keys(changedKeys).length === 0) return undefined;
+
+  const receipt: ModelsJsonFixReceiptV1 = {
+    version: 1,
+    kind: "pi-cache-optimizer-fix-receipt",
+    transactionId: randomUUID(),
+    provider,
+    modelId,
+    placement,
+    targetExistedBefore,
+    changedKeys,
+    beforeHash: hashText(originalText),
+    afterHash: hashText(modifiedText),
+    backupFile,
+    createdAt: now,
+    appliedAt: now,
+  };
+  return parseModelsJsonFixReceipt(receipt);
+}
+
+function maskJsonSyntaxPreservingComments(text: string, start: number, end: number): string {
+  // Replace only JSON syntax/value bytes. Comments are copied verbatim so a
+  // user explanation attached to a receipt-owned key survives a surgical
+  // rollback. Newlines are also retained to keep line structure unchanged.
+  const output = text.slice(start, end).split("");
+  let i = start;
+  let inLineComment = false;
+  let inBlockComment = false;
+  let inString = false;
+  let escaped = false;
+  while (i < end) {
+    const ch = text[i];
+    const next = text[i + 1];
+    const offset = i - start;
+    if (inLineComment) {
+      if (ch === "\n" || ch === "\r") inLineComment = false;
+      i++;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        i += 2;
+        inBlockComment = false;
+      } else {
+        i++;
+      }
+      continue;
+    }
+    if (inString) {
+      if (ch === "\n" || ch === "\r") {
+        i++;
+        continue;
+      }
+      output[offset] = " ";
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      output[offset] = " ";
+    } else if (ch === "/" && next === "/") {
+      inLineComment = true;
+      i += 2;
+      continue;
+    } else if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      i += 2;
+      continue;
+    } else if (ch !== "\n" && ch !== "\r") {
+      output[offset] = " ";
+    }
+    i++;
+  }
+  return output.join("");
+}
+
+type JsonPropertyEdit = { start: number; end: number; text: string };
+
+function locateJsonPropertyValueSpan(
+  text: string,
+  objectBrace: number,
+  objectEnd: number,
+  key: string,
+): { keyStart: number; valueStart: number; valueEnd: number; removal: JsonPropertyEdit } | undefined {
+  const clean = stripJsoncComments(text);
+  const property = findJsonObjectKey(clean, objectBrace, key);
+  if (!property || property.keyStart >= objectEnd || property.count !== 1) return undefined;
+  const valueStart = skipJsonWhitespace(clean, property.valueStart);
+  const valueEnd = skipJsonValue(clean, valueStart);
+  if (valueEnd === undefined || valueEnd > objectEnd) return undefined;
+
+  const next = skipJsonWhitespace(clean, valueEnd);
+  if (clean[next] === ",") {
+    return {
+      keyStart: property.keyStart,
+      valueStart,
+      valueEnd,
+      removal: {
+        start: property.keyStart,
+        end: next + 1,
+        text: maskJsonSyntaxPreservingComments(text, property.keyStart, next + 1),
+      },
+    };
+  }
+
+  let previous = property.keyStart - 1;
+  while (previous >= objectBrace && isJsonWhitespace(clean[previous])) previous--;
+  const removalStart = clean[previous] === "," ? previous : property.keyStart;
+  return {
+    keyStart: property.keyStart,
+    valueStart,
+    valueEnd,
+    removal: {
+      start: removalStart,
+      end: valueEnd,
+      text: maskJsonSyntaxPreservingComments(text, removalStart, valueEnd),
+    },
+  };
+}
+
+function composeModelsJsonReceiptRollback(
+  currentText: string,
+  receipt: ModelsJsonFixReceiptV1,
+): { modifiedText: string; changed: boolean } | { error: string } {
+  if (!receipt.targetExistedBefore) {
+    return { error: "the fix created a new target entry and the file changed; refusing to remove user changes automatically" };
+  }
+
+  const target = locateReceiptCompatTarget(currentText, receipt.provider, receipt.modelId, receipt.placement);
+  if (!target?.targetExists) {
+    return { error: "the original target entry is missing or no longer safely locatable" };
+  }
+  if (target.compatBrace < 0 || target.compatEnd <= target.compatBrace) {
+    return { error: "the target compat object is missing or no longer safely locatable" };
+  }
+
+  const edits: JsonPropertyEdit[] = [];
+  for (const [key, change] of Object.entries(receipt.changedKeys)) {
+    const current = readReceiptCompatScalarState(currentText, target, key);
+    if (!current || !sameReceiptScalarState(current, change.after)) {
+      return { error: `receipt-owned compat.${key} was changed after the fix; refusing to overwrite it` };
+    }
+    const property = locateJsonPropertyValueSpan(currentText, target.compatBrace, target.compatEnd, key);
+    if (!property) return { error: `receipt-owned compat.${key} is no longer safely locatable` };
+    if (change.before.present) {
+      edits.push({
+        start: property.valueStart,
+        end: property.valueEnd,
+        text: JSON.stringify(change.before.value),
+      });
+    } else {
+      edits.push(property.removal);
+    }
+  }
+
+  const modifiedText = edits
+    .sort((left, right) => right.start - left.start)
+    .reduce((text, edit) => text.slice(0, edit.start) + edit.text + text.slice(edit.end), currentText);
+  return { modifiedText, changed: modifiedText !== currentText };
+}
+
+function validateModelsJsonRollback(
+  writtenText: string,
+  receipt: ModelsJsonFixReceiptV1,
+  expectedHash?: string,
+): string | null {
+  if (expectedHash !== undefined && hashText(writtenText) !== expectedHash) {
+    return "rollback result hash did not match the expected pre-fix file";
+  }
+  try {
+    parseJsonc(writtenText);
+  } catch {
+    return "rollback result is not valid JSONC";
+  }
+  // An exact hash check proves the complete pre-fix document, including a
+  // newly created target entry (which intentionally did not exist before).
+  if (expectedHash !== undefined) return null;
+
+  const target = locateReceiptCompatTarget(writtenText, receipt.provider, receipt.modelId, receipt.placement);
+  if (!target?.targetExists) return "rollback result lost the original target entry";
+  for (const [key, change] of Object.entries(receipt.changedKeys)) {
+    const state = readReceiptCompatScalarState(writtenText, target, key);
+    if (!state || !sameReceiptScalarState(state, change.before)) return `rollback result did not restore compat.${key}`;
+  }
+  return null;
+}
+
+type ModelsJsonRollbackPlan = {
+  receiptSnapshot: ModelsJsonFixReceiptSnapshot;
+  receipt: ModelsJsonFixReceiptV1;
+  currentHash: string;
+  modifiedText: string;
+  expectedResultHash?: string;
+  mode: "exact" | "surgical";
+  fileMode: number;
+  originalBackupPath: string;
+  rollbackBackupPath: string;
+};
+
+async function readRegularTextFile(path: string): Promise<{ text: string; mode: number }> {
+  const info = await lstat(path);
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new Error("file is not a regular file");
+  }
+  const text = await readFile(path, "utf8");
+  const afterRead = await lstat(path);
+  if (
+    afterRead.isSymbolicLink() ||
+    !afterRead.isFile() ||
+    !sameFileIdentity(info, afterRead)
+  ) {
+    throw new Error("file changed while it was being read");
+  }
+  return {
+    text,
+    mode: afterRead.mode & 0o7777,
+  };
+}
+
+async function prepareModelsJsonRollback(
+  receiptSnapshot: ModelsJsonFixReceiptSnapshot | undefined,
+  modelsPath: string = MODELS_JSON_PATH,
+): Promise<ModelsJsonRollbackPlan | { error: string }> {
+  const receipt = receiptSnapshot?.receipt;
+  if (!receiptSnapshot || !isActionableModelsJsonFixReceipt(receipt)) {
+    return { error: "No unapplied /cache-optimizer fix receipt was found." };
+  }
+
+  let current: { text: string; mode: number };
+  try {
+    current = await readRegularTextFile(modelsPath);
+  } catch {
+    return { error: "models.json is missing or is not a regular file; no changes were made." };
+  }
+  const currentHash = hashText(current.text);
+  const originalBackupPath = join(dirname(modelsPath), receipt.backupFile);
+  const rollbackBackupPath = createRollbackBackupPath(modelsPath);
+
+  if (currentHash === receipt.afterHash) {
+    let backup: { text: string; mode: number };
+    try {
+      backup = await readRegularTextFile(originalBackupPath);
+    } catch {
+      return { error: "The receipt backup is missing or is not a regular file; refusing to overwrite models.json." };
+    }
+    if (hashText(backup.text) !== receipt.beforeHash) {
+      return { error: "The receipt backup hash does not match the recorded pre-fix file; refusing to overwrite models.json." };
+    }
+    try {
+      parseJsonc(backup.text);
+    } catch {
+      return { error: "The receipt backup is not valid JSONC; refusing to overwrite models.json." };
+    }
+    return {
+      receiptSnapshot,
+      receipt,
+      currentHash,
+      modifiedText: backup.text,
+      expectedResultHash: receipt.beforeHash,
+      mode: "exact",
+      fileMode: current.mode,
+      originalBackupPath,
+      rollbackBackupPath,
+    };
+  }
+
+  if (!receipt.targetExistedBefore) {
+    return {
+      error: "models.json changed after the fix, and the fix created the target entry. Refusing to remove or overwrite unrelated user changes; use the recorded backup for manual guidance.",
+    };
+  }
+
+  // A changed file is eligible only for a scalar, receipt-owned surgical
+  // rollback. Validate the current document before showing a confirmation;
+  // malformed JSONC must never be replaced by an edit derived from offsets.
+  try {
+    parseJsonc(current.text);
+  } catch {
+    return { error: "models.json changed after the fix and is not valid JSONC; refusing to overwrite user changes. Use the recorded backup for manual guidance." };
+  }
+
+  const surgical = composeModelsJsonReceiptRollback(current.text, receipt);
+  if ("error" in surgical) {
+    return {
+      error: `models.json changed after the fix. ${surgical.error}. Use the recorded backup for manual guidance.`,
+    };
+  }
+  if (!surgical.changed) {
+    return { error: "No receipt-owned change remains to roll back." };
+  }
+
+  return {
+    receiptSnapshot,
+    receipt,
+    currentHash,
+    modifiedText: surgical.modifiedText,
+    mode: "surgical",
+    fileMode: current.mode,
+    originalBackupPath,
+    rollbackBackupPath,
+  };
 }
 
 // Internal helpers exported only so the task verification script
@@ -7747,7 +9265,9 @@ export const __internals_for_tests = {
   describeMissingOpenAICompatibleProxyCompat,
   describeOptionalOpenAICompatibleProxyCompat,
   describeMissingDeepSeekCompat,
+  isDeepSeekWireCompatApplicable,
   isDeepSeekCompatCheckApplicable,
+  hasExplicitDeepSeekReasoningProtocol,
   describeMissingCacheCompatForModel,
   buildDeepSeekCompatSuggestion,
   buildDeepSeekCompatWarningText,
@@ -7761,6 +9281,12 @@ export const __internals_for_tests = {
   isOpenAISdkHeader403Applicable,
   hasPromptCacheRetentionUnsupportedSignal,
   hasPromptCacheRetentionUnsupportedErrorMessage,
+  hasReasoningProtocolRejectionText,
+  hasReasoningProtocolRejectionSignal,
+  hasReasoningProtocolRejectionErrorMessage,
+  isReasoningProtocolRejectionSignalApplicable,
+  isReasoningProtocolRejectionForModel,
+  buildReasoningProtocolFixSuggestion,
   // Non-GPT OpenAI-compatible model detection
   isKimiLikeModel,
   isKimiLikeAssistantMessage,
@@ -7958,6 +9484,7 @@ export const __internals_for_tests = {
   // Routing-provider protocol helpers
   PI_ROUTING_REGISTRY_SYMBOL,
   PI_CACHE_HINTS_SYMBOL,
+  REASONING_PROTOCOL_FALLBACK_SYMBOL,
   ensureRoutingRegistry,
   getRoutingRegistry,
   parseRouteSnapshot,
@@ -7995,6 +9522,8 @@ export const __internals_for_tests = {
   STATE_FILE_PATH,
   LEGACY_STATE_FILE_PATH,
   SHARD_STATE_DIR,
+  FIX_RECEIPT_FILE_NAME,
+  FIX_RECEIPT_PATH,
   SHARD_FILES_DIR,
   SHARD_GLOBAL_EPOCH_PATH,
   STATE_DIR,
@@ -8022,6 +9551,20 @@ export const __internals_for_tests = {
   atomicReplaceTextFilePreservingMode,
   atomicRestoreFileFromBackup,
   applyModelsJsonFixTransaction,
+  hashText,
+  parseModelsJsonFixReceipt,
+  isActionableModelsJsonFixReceipt,
+  hasReceiptReasoningProtocolChange,
+  createRollbackBackupPath,
+  createModelsJsonFixReceipt,
+  writeModelsJsonFixReceipt,
+  readModelsJsonFixReceipt,
+  readModelsJsonFixReceiptSnapshot,
+  markModelsJsonFixReceiptRolledBack,
+  receiptBackupPath,
+  composeModelsJsonReceiptRollback,
+  validateModelsJsonRollback,
+  prepareModelsJsonRollback,
   // Fix suggestion builder
   buildFixSuggestion,
   // Adaptive thinking compat helpers
@@ -8046,6 +9589,9 @@ export default function (pi: ExtensionAPI) {
   const warnedSendSessionAffinityHeaders403Models = new Set<string>();
   const openAISdkHeader403Models = new Set<string>();
   const warnedOpenAISdkHeader403Models = new Set<string>();
+  const reasoningProtocolFallbackState = getReasoningProtocolFallbackState();
+  const reasoningProtocolRejectedModels = reasoningProtocolFallbackState.modelKeys;
+  const warnedReasoningProtocolRejectedModels = reasoningProtocolFallbackState.warnedModelKeys;
   let cacheStatsByModel: Record<string, CacheStats> = {};
   let cacheStatsProcessByModel: Record<string, CacheStats> = {};
   let cacheStatsTotalsByModel: Record<string, CacheStats> = {};
@@ -8069,6 +9615,7 @@ export default function (pi: ExtensionAPI) {
   let currentSessionHashSet = false;
   let lastActualRoutedModel: PersistedRoutedModelRef | undefined;
   let latestCacheHint: PiCacheHintSnapshot | undefined;
+  let pendingProviderResponseModel: PiModel | undefined;
   let shardCreatedAt = Date.now();
   const PERSIST_DEBOUNCE_MS = 2000;
   const SHARD_REFRESH_DEBOUNCE_MS = 250;
@@ -8097,7 +9644,14 @@ export default function (pi: ExtensionAPI) {
 
   function buildCommandFixSuggestion(model: PiModel): FixSuggestion | undefined {
     const regular = buildFixSuggestion(model);
-    const observed = buildObservedRuntimeFixSuggestion(model);
+    const observedReasoning = buildReasoningProtocolFixSuggestion(
+      model,
+      reasoningProtocolRejectedModels.has(modelKey(model)),
+    );
+    const observed = mergeFixSuggestions(
+      buildObservedRuntimeFixSuggestion(model),
+      observedReasoning,
+    );
     if (!regular) return observed;
     if (!observed) return regular;
     return {
@@ -8604,6 +10158,7 @@ export default function (pi: ExtensionAPI) {
       shardWatcher?.close();
       shardWatcher = undefined;
       latestCacheHint = undefined;
+      pendingProviderResponseModel = undefined;
       delete getProtocolGlobal().__piCacheOptimizerCacheKey__;
       uninstallCacheHintsService();
       restoreCacheRetentionEnv(STARTUP_CACHE_RETENTION_ENV);
@@ -8745,6 +10300,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_provider_request", (event, ctx) => {
     const requestModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+    pendingProviderResponseModel = runtimeOptimizerEnabled
+      ? snapshotProviderRequestModel(requestModel)
+      : undefined;
     let requestPayload: unknown = event.payload;
     let toolOrderChanged = false;
 
@@ -8806,9 +10364,33 @@ export default function (pi: ExtensionAPI) {
     return withCacheKey ?? (toolOrderChanged ? requestPayload : undefined);
   });
 
-  pi.on("after_provider_response", (event, ctx) => {
-    const model = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
-    if (!runtimeOptimizerEnabled || !model) return;
+  pi.on("after_provider_response", async (event, ctx) => {
+    // Keep the request snapshot until the corresponding assistant message ends.
+    // Pi's response hook exposes only status/headers; the finalized error may
+    // carry the useful protocol text later in message_end. A subsequent request
+    // replaces this process-local snapshot, and shutdown clears it.
+    const correlatedModel = pendingProviderResponseModel;
+    const model = correlatedModel ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
+    if (!runtimeOptimizerEnabled || !model) {
+      pendingProviderResponseModel = undefined;
+      return;
+    }
+
+    // Keep only the category, never the provider's complete error text. This
+    // is evidence for a later, model-scoped `/fix`; it never edits config from
+    // a response hook.
+    if (
+      isReasoningProtocolRejectionSignalApplicable(model) &&
+      event.status === 400 &&
+      hasReasoningProtocolRejectionSignal(event.headers)
+    ) {
+      await notifyReasoningProtocolObservation(
+        model,
+        ctx,
+        reasoningProtocolRejectedModels,
+        warnedReasoningProtocolRejectedModels,
+      );
+    }
 
     // ── 400: prompt_cache_retention unsupported ──
     if (event.status === 400) {
@@ -8870,13 +10452,39 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", async (event, ctx) => {
     syncSessionHash(ctx);
     const msgRecord = asRecord(event.message);
+    const requestModelForMessage = msgRecord?.role === "assistant"
+      ? pendingProviderResponseModel
+      : undefined;
+    if (msgRecord?.role === "assistant") {
+      // If a transport failed before emitting after_provider_response, do not
+      // let its request snapshot be consumed by a later response. Normal
+      // responses already clear this in after_provider_response.
+      pendingProviderResponseModel = undefined;
+    }
 
     // Some providers expose an HTTP 400 error body only through the finalized
     // assistant error message; after_provider_response may contain the status
-    // and no diagnostic response headers. Record the same model-scoped
-    // prompt_cache_retention fallback from that authoritative message identity.
+    // and no diagnostic response headers. Record only the model-scoped
+    // reasoning-protocol category from that authoritative message identity.
+    if (runtimeOptimizerEnabled && hasReasoningProtocolRejectionErrorMessage(event.message)) {
+      const fallbackModel = requestModelForMessage
+        ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
+      const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
+      const errorModel = messageModel
+        ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
+        : undefined;
+      if (isReasoningProtocolRejectionForModel(event.message, errorModel)) {
+        await notifyReasoningProtocolObservation(
+          errorModel,
+          ctx,
+          reasoningProtocolRejectedModels,
+          warnedReasoningProtocolRejectedModels,
+        );
+      }
+    }
     if (runtimeOptimizerEnabled && hasPromptCacheRetentionUnsupportedErrorMessage(event.message)) {
-      const fallbackModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+      const fallbackModel = requestModelForMessage
+        ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
       const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
       const errorModel = messageModel
         ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
@@ -8900,7 +10508,8 @@ export default function (pi: ExtensionAPI) {
     // non-retryable 400 in Pi 0.82.1, so the fallback applies to the next
     // subsequent request (and to a retry only if another layer initiates one).
     if (hasAnthropicCacheTtlOrderError(event.message)) {
-      const fallbackModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+      const fallbackModel = requestModelForMessage
+        ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
       const errorModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
       if (errorModel && isAnthropicMessagesApi(errorModel.api)) {
         const key = modelKey(errorModel);
@@ -9022,6 +10631,7 @@ export default function (pi: ExtensionAPI) {
   //   compat  — show compat suggestion with file path
   //   config footer-mode total|session|process — persist footer mode override
   //   fix     — auto-fix compat issues (writes models.json, requires UI)
+  //   rollback — undo the latest confirmed fix for the active model
   //   reset   — reset current provider/model footer stats bucket (local only)
   //   (no args) — interactive menu (with UI) or help summary
   // ────────────────────────────────────────────────────────────────
@@ -9043,6 +10653,7 @@ export default function (pi: ExtensionAPI) {
         cmdCtx.ui.notify(`✅ Pi Cache Optimizer enabled for this Pi process. Local footer stats were reset for before/after comparison.\n${formatOptimizerRuntimeMode()}`, "info");
       } else if (subcommand === "disable") {
         setRuntimeOptimizerEnabled(false);
+        pendingProviderResponseModel = undefined;
         await resetCurrentSessionStats();
         await flushPersistCacheStats(cmdCtx);
         await publishStatus(cmdCtx, model);
@@ -9120,6 +10731,105 @@ export default function (pi: ExtensionAPI) {
               ? "✅ Compat fully configured."
               : getCompatCheckNotApplicableLines(model).join("\n"),
             "info",
+          );
+        }
+      } else if (subcommand === "rollback") {
+        if (!model) {
+          cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+          return;
+        }
+        if (!cmdCtx.hasUI) {
+          const receipt = await readModelsJsonFixReceipt();
+          const backupHint = receipt && isActionableModelsJsonFixReceipt(receipt)
+            ? ` The recorded backup is ${receipt.backupFile} next to ${getModelsJsonDisplayPath()}.`
+            : " Check the recorded models.json backup manually if a fix receipt exists.";
+          cmdCtx.ui.notify(
+            "❌ Rollback requires interactive confirmation. No changes were made.\n" +
+            `Run /cache-optimizer rollback in Pi's interactive UI.${backupHint} Then run /reload.`,
+            "warning",
+          );
+          return;
+        }
+
+        const receiptSnapshot = await readModelsJsonFixReceiptSnapshot();
+        const receipt = receiptSnapshot?.receipt;
+        if (!receiptSnapshot || !isActionableModelsJsonFixReceipt(receipt)) {
+          cmdCtx.ui.notify("ℹ️ No unapplied /cache-optimizer fix receipt was found.", "info");
+          return;
+        }
+        if (receipt.provider !== model.provider || receipt.modelId !== model.id) {
+          cmdCtx.ui.notify(
+            `ℹ️ The latest fix receipt is for ${receipt.provider}/${receipt.modelId}, not the active model ${model.provider}/${model.id}. ` +
+            "Switch to the matching model before running rollback. No changes were made.",
+            "warning",
+          );
+          return;
+        }
+
+        const rollback = await prepareModelsJsonRollback(receiptSnapshot);
+        if ("error" in rollback) {
+          cmdCtx.ui.notify(`ℹ️ ${rollback.error}`, "info");
+          return;
+        }
+
+        const rollbackScope = rollback.mode === "exact"
+          ? "restore the exact pre-fix models.json because the file is unchanged since the fix"
+          : "restore only the receipt-owned compat scalar keys and preserve subsequent user changes";
+        const rollbackPreview = [
+          `Rollback transaction ${rollback.receipt.transactionId}:`,
+          `Model: ${rollback.receipt.provider}/${rollback.receipt.modelId}`,
+          `Action: ${rollbackScope}.`,
+          `A new rollback backup will be written to: ${rollback.rollbackBackupPath}`,
+          "Comments, credentials, unrelated fields, and the existing access mode will be preserved.",
+          "Afterward, run /reload or restart Pi for the configuration change to take effect.",
+          "",
+          "Proceed with rollback?",
+        ].join("\n");
+        const confirmed = await cmdCtx.ui.confirm("Cache Optimizer — Rollback", rollbackPreview);
+        if (!confirmed) {
+          cmdCtx.ui.notify("No changes were made. Rollback canceled by user.", "info");
+          return;
+        }
+
+        try {
+          const result = await applyModelsJsonFixTransaction(
+            rollback.modifiedText,
+            rollback.rollbackBackupPath,
+            (writtenText) => validateModelsJsonRollback(
+              writtenText,
+              rollback.receipt,
+              rollback.expectedResultHash,
+            ),
+            {
+              expectedCurrentHash: rollback.currentHash,
+              expectedCurrentMode: rollback.fileMode,
+              receiptGuard: rollback.receiptSnapshot,
+              purpose: "rollback",
+              onCommitted: async () => {
+                await markModelsJsonFixReceiptRolledBack(rollback.receiptSnapshot);
+              },
+            },
+          );
+          if ("postCheckError" in result) {
+            cmdCtx.ui.notify(
+              `❌ Rollback self-check failed: ${result.postCheckError}\n` +
+              `The rollback backup at ${rollback.rollbackBackupPath} was restored. No changes applied.`,
+              "error",
+            );
+            return;
+          }
+          invalidateModelsConfigCache();
+          cmdCtx.ui.notify(
+            `✅ Rollback completed for ${rollback.receipt.provider}/${rollback.receipt.modelId}.\n` +
+            `Rollback backup saved to: ${rollback.rollbackBackupPath}\n` +
+            "The receipt was marked as rolled back. Run /reload or restart Pi for the change to take effect.",
+            "info",
+          );
+        } catch (rollbackError) {
+          cmdCtx.ui.notify(
+            `❌ Rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}\n` +
+            "No automatic overwrite was performed; use the recorded backup for manual guidance.",
+            "error",
           );
         }
       } else if (subcommand === "reset") {
@@ -9253,6 +10963,7 @@ export default function (pi: ExtensionAPI) {
             const checkError = selfCheckMissingEntryInsertion(
               originalText, plan.modifiedText,
               suggestion.providerLabel, suggestion.modelId, suggestion.compatKeys,
+              model,
             );
             if (checkError !== null) {
               // Fall through to manual guidance.
@@ -9297,6 +11008,20 @@ export default function (pi: ExtensionAPI) {
               );
               if (confirmed) {
                 try {
+                  const receipt = createModelsJsonFixReceipt(
+                    originalText,
+                    plan.modifiedText,
+                    suggestion.providerLabel,
+                    suggestion.modelId,
+                    "modelOverride",
+                    suggestion.compatKeys,
+                    repairsExistingOverride,
+                    backupPath,
+                  );
+                  if (!receipt) {
+                    cmdCtx.ui.notify("❌ Could not create a privacy-safe fix receipt. No changes were made.", "error");
+                    return;
+                  }
                   const result = await applyModelsJsonFixTransaction(
                     plan.modifiedText,
                     backupPath,
@@ -9306,7 +11031,13 @@ export default function (pi: ExtensionAPI) {
                       suggestion.providerLabel,
                       suggestion.modelId,
                       suggestion.compatKeys,
+                      model,
                     ),
+                    {
+                      expectedCurrentHash: hashText(originalText),
+                      purpose: "fix",
+                      onCommitted: async () => writeModelsJsonFixReceipt(receipt),
+                    },
                   );
                   if ("postCheckError" in result) {
                     cmdCtx.ui.notify(
@@ -9316,6 +11047,7 @@ export default function (pi: ExtensionAPI) {
                     );
                     return;
                   }
+                  invalidateModelsConfigCache();
                   cmdCtx.ui.notify(
                     `✅ Fix applied to ${getModelsJsonDisplayPath()}.\n` +
                     `Backup saved to: ${backupPath}\n` +
@@ -9393,10 +11125,45 @@ export default function (pi: ExtensionAPI) {
           suggestion.providerLabel,
           suggestion.forceModelLevel,
         );
-        const modifiedText = composeFixInsertion(originalText, location, suggestion.compatKeys, decision.placement);
+        const createsModelOverride = decision.placement === "modelOverride" && location.modelOverrideObjectBrace < 0;
+        const modelOverridePlan = createsModelOverride
+          ? composeModelOverrideInsertion(
+              originalText,
+              suggestion.providerLabel,
+              suggestion.modelId,
+              suggestion.compatKeys,
+            )
+          : undefined;
+        if (createsModelOverride && !modelOverridePlan) {
+          cmdCtx.ui.notify(
+            "❌ Could not safely create the highest-precedence model override. No changes were made.",
+            "error",
+          );
+          return;
+        }
+        const modifiedText = modelOverridePlan?.modifiedText
+          ?? composeFixInsertion(originalText, location, suggestion.compatKeys, decision.placement);
 
-        // Self-check
-        const checkError = selfCheckFix(originalText, modifiedText, suggestion.providerLabel, suggestion.modelId, suggestion.compatKeys, decision.placement);
+        // Self-check against the same provider → model → runtime →
+        // modelOverride precedence used by request hooks.
+        const checkError = createsModelOverride
+          ? selfCheckMissingEntryInsertion(
+              originalText,
+              modifiedText,
+              suggestion.providerLabel,
+              suggestion.modelId,
+              suggestion.compatKeys,
+              model,
+            )
+          : selfCheckFix(
+              originalText,
+              modifiedText,
+              suggestion.providerLabel,
+              suggestion.modelId,
+              suggestion.compatKeys,
+              decision.placement,
+              model,
+            );
         if (checkError !== null) {
           cmdCtx.ui.notify(
             `❌ Self-check failed before write: ${checkError}\n` +
@@ -9461,17 +11228,46 @@ export default function (pi: ExtensionAPI) {
 
         // Write: backup → temp + rename → self-check again
         try {
+          const receipt = createModelsJsonFixReceipt(
+            originalText,
+            modifiedText,
+            suggestion.providerLabel,
+            suggestion.modelId,
+            decision.placement,
+            suggestion.compatKeys,
+            !createsModelOverride,
+            backupPath,
+          );
+          if (!receipt) {
+            cmdCtx.ui.notify("❌ Could not create a privacy-safe fix receipt. No changes were made.", "error");
+            return;
+          }
           const result = await applyModelsJsonFixTransaction(
             modifiedText,
             backupPath,
-            (writtenText) => selfCheckFix(
-              originalText,
-              writtenText,
-              suggestion.providerLabel,
-              suggestion.modelId,
-              suggestion.compatKeys,
-              decision.placement,
-            ),
+            (writtenText) => createsModelOverride
+              ? selfCheckMissingEntryInsertion(
+                  originalText,
+                  writtenText,
+                  suggestion.providerLabel,
+                  suggestion.modelId,
+                  suggestion.compatKeys,
+                  model,
+                )
+              : selfCheckFix(
+                  originalText,
+                  writtenText,
+                  suggestion.providerLabel,
+                  suggestion.modelId,
+                  suggestion.compatKeys,
+                  decision.placement,
+                  model,
+                ),
+            {
+              expectedCurrentHash: hashText(originalText),
+              purpose: "fix",
+              onCommitted: async () => writeModelsJsonFixReceipt(receipt),
+            },
           );
           if ("postCheckError" in result) {
             cmdCtx.ui.notify(
@@ -9506,6 +11302,7 @@ export default function (pi: ExtensionAPI) {
             "Stats — Show current-session model statistics",
             "Compat — Show compat suggestion",
             "Fix — Auto-fix compat issues (writes models.json)",
+            "Rollback — Undo the latest confirmed fix",
             "Footer mode — Choose total, session, or process stats",
             "Reset — Reset local provider/model stats",
             "Cancel",
@@ -9524,6 +11321,8 @@ export default function (pi: ExtensionAPI) {
           } else if (choice === menuOptions[5]) {
             await handleCacheOptimizerCommand("fix", cmdCtx);
           } else if (choice === menuOptions[6]) {
+            await handleCacheOptimizerCommand("rollback", cmdCtx);
+          } else if (choice === menuOptions[7]) {
             const modeOptions = ["session — Current Pi conversation session (default)", "total — All local sessions today", "process — Current extension instance only", "Cancel"];
             const modeChoice = await cmdCtx.ui.select("Footer cache stats mode", modeOptions);
             const nextMode = modeChoice === modeOptions[0]
@@ -9534,7 +11333,7 @@ export default function (pi: ExtensionAPI) {
                   ? "process"
                   : undefined;
             if (nextMode) await handleCacheOptimizerCommand(`config footer-mode ${nextMode}`, cmdCtx);
-          } else if (choice === menuOptions[7]) {
+          } else if (choice === menuOptions[8]) {
             await handleCacheOptimizerCommand("reset", cmdCtx);
           }
           // choice === "cancel" or undefined → no action
@@ -9553,6 +11352,7 @@ export default function (pi: ExtensionAPI) {
         diagnosis.push("  compat  — Show compat suggestion with edit location");
         diagnosis.push("  config footer-mode total|session|process — Persist the footer stats mode");
         diagnosis.push("  fix     — Auto-fix compat issues (writes models.json, requires UI)");
+        diagnosis.push("  rollback — Undo the latest confirmed fix (requires UI confirmation)");
         diagnosis.push("  reset   — Reset local provider/model stats for current model (does not affect upstream)");
         diagnosis.push("");
         diagnosis.push(formatOptimizerRuntimeMode());

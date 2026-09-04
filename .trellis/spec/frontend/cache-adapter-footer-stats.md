@@ -309,24 +309,23 @@ excluded. If no non-empty effective base URL can be established, the bridge fail
 adds no affinity headers, and diagnostics report the compat check as not applicable rather
 than claiming the channel is fully configured.
 
-#### DeepSeek Pi Mono compat warning
+#### DeepSeek protocol-first compat warning
 
-For DeepSeek-like models using an OpenAI-compatible Pi API
-(`openai-completions` or `openai-responses`), warn once per model when merged
-compat lacks DeepSeek-specific reasoning/cache fields. The missing-list logic is
-adapter-aware and MUST include:
+DeepSeek-like model ids/names continue to select the `DS cache` adapter, but they
+are not evidence of a reasoning wire protocol. `supportsReasoningEffort: true`,
+provider ids, and endpoint URLs are not protocol proof. For an
+`openai-completions` DeepSeek-like model, DeepSeek-specific reasoning/replay
+compat diagnostics apply ONLY when the effective compat explicitly contains
+`thinkingFormat: "deepseek"`.
 
-* `supportsLongCacheRetention: true` when absent.
-* `sendSessionAffinityHeaders: true` for `openai-completions` when absent.
-* For `openai-responses`, Pi 0.80.7+ uses `sessionAffinityFormat` (`openai`, `openai-nosession`, or `openrouter`) and auto-detects the default. The extension MUST NOT diagnose or write the removed `sendSessionIdHeader` field.
-* `requiresReasoningContentOnAssistantMessages: true` when absent.
-* `thinkingFormat: "deepseek"` when absent or different.
-
-The copyable DeepSeek JSON suggestion MAY include all missing fields above. This
-is different from the generic third-party OpenAI-compatible proxy advice:
-DeepSeek's Pi Mono guidance explicitly requires the `reasoning_content` replay
-compat and DeepSeek thinking format. The warning remains advisory only and MUST
-NOT mutate `models.json`.
+When that explicit format is active, the missing-list logic MAY include only
+`requiresReasoningContentOnAssistantMessages: true` for replay safety. It MUST
+NOT list `thinkingFormat` as missing and MUST NOT infer or add
+`thinkingFormat: "deepseek"`. Explicit `openai`, `qwen`, `openrouter`, and
+`together` formats, as well as an absent format, retain generic OpenAI-compatible
+cache/routing diagnostics only. The copyable ordinary fix suggestion therefore
+contains only safe generic fields; protocol changes require explicit provider
+error evidence and a model-scoped review.
 
 ### Platform-friendly models.json path
 
@@ -832,7 +831,7 @@ const statsKey = `${responseModel.provider}/${responseModel.id}`;
 
 ## Forbidden patterns
 
-* Writing `models.json` outside `/cache-optimizer fix`'s explicit preview + confirmation flow. The fix flow may create a timestamped backup and atomically replace `models.json`. For providers/models that already have entries, it only inserts/repairs safe `compat` keys or a missing `compat` object at the effective provider/model/modelOverrides layer. For API-logged-in providers (e.g. opencode go) that have no custom model entry, it MAY offer to create a minimal compat-only `modelOverrides` entry with UI confirmation, backup, and atomic write; it MUST NOT create custom model definitions, API keys, credentials, base URLs, or router slugs under any scenario.
+* Writing `models.json` outside `/cache-optimizer fix` or `/cache-optimizer rollback`'s explicit preview + confirmation flow. The fix flow may create a timestamped backup and atomically replace `models.json`; rollback may restore a receipt-owned transaction through the same guarded contract. For providers/models that already have entries, fix only inserts/repairs safe `compat` keys or a missing `compat` object at the effective provider/model/modelOverrides layer. For API-logged-in providers (e.g. opencode go) that have no custom model entry, it MAY offer to create a minimal compat-only `modelOverrides` entry with UI confirmation, backup, and atomic write; it MUST NOT create custom model definitions, API keys, credentials, base URLs, or router slugs under any scenario.
 * Reading or logging the value of `DEEPSEEK_API_KEY` (or any other API key env var).
 * Storing prompts, request payloads, response bodies, or HTTP headers in any
   on-disk file produced by this extension.
@@ -1026,8 +1025,10 @@ API through a non-`api.openai.com` base URL) and its merged `compat` lacks
 ```
 
 DeepSeek-like models using Pi Mono guidance may also surface `⚠️ compat` when
-`requiresReasoningContentOnAssistantMessages` or `thinkingFormat: "deepseek"`
-are missing, even when the provider is otherwise not a generic proxy.
+`requiresReasoningContentOnAssistantMessages` is missing, but only when the
+explicit effective `thinkingFormat: "deepseek"` protocol is active. The marker
+never treats `thinkingFormat` itself as missing and never appears for absent or
+explicit non-DeepSeek formats merely because the model is DeepSeek-named.
 Native `anthropic-messages` adaptive-generation models may also surface
 `⚠️ compat`: Claude opus-4.6+ including Opus 5, sonnet-4.6+ including Sonnet 5,
 and fable-5+ require `forceAdaptiveThinking: true`; Kimi Coding K3 / `kimi-for-coding`
@@ -1058,14 +1059,14 @@ Rules:
 ## Diagnostic command (`/cache-optimizer`)
 
 The extension registers a Pi command `/cache-optimizer` with runtime, diagnostic,
-configuration, repair, and reset subcommands. It MUST register Pi's native
+configuration, repair, rollback, and reset subcommands. It MUST register Pi's native
 `getArgumentCompletions(argumentPrefix)` callback rather than a custom editor or
 autocomplete provider. TypeScript validation consumes the installed official Pi
 0.84.4 declarations directly; a complete local ambient redeclaration is forbidden
 because it can hide upstream API drift. Pi 0.84's expanded event/context surface
 is compatible with the subset used here. The callback completes the supported top-level
 subcommands (`enable`, `disable`, `doctor`, `stats`, `config`, `compat`, `reset`,
-and `fix`), the nested `config footer-mode` path, and the values `total`,
+`fix`, and `rollback`), the nested `config footer-mode` path, and the values `total`,
 `session`, and `process`. Suggestions are case-insensitive prefix matches after
 leading/trailing whitespace is tolerated; an unknown or non-matching prefix
 returns `null` so Pi can fall back normally. Command execution parsing remains
@@ -1214,9 +1215,10 @@ It covers the same safe defaults shown by doctor/compat:
   `anthropic-messages` Claude opus-4.6+ (including Opus 5)/sonnet-4.6+
   (including Sonnet 5)/fable-5+ and Kimi Coding K3 / `kimi-for-coding`; the Kimi Coding models also
   get `allowEmptySignature: true`.
-* DeepSeek Pi Mono compat: `thinkingFormat: "deepseek"`,
-  `requiresReasoningContentOnAssistantMessages: true`, plus cache/session-affinity
-  flags that are part of the DeepSeek safe suggestion.
+* DeepSeek Pi Mono replay compat: `requiresReasoningContentOnAssistantMessages: true`
+  only when effective `thinkingFormat: "deepseek"` was explicitly configured.
+  Ordinary DeepSeek-named models receive generic cache/session-affinity guidance;
+  this command never invents `thinkingFormat: "deepseek"`.
 * Generic OpenAI-compatible proxy affinity: `sendSessionAffinityHeaders: true`
   when missing. It does **not** auto-enable optional generic
   `supportsLongCacheRetention`.
@@ -1245,9 +1247,11 @@ Safety contract:
 * On post-write failure, rollback MUST also use temp file + atomic rename; direct
   in-place copy over `models.json` is forbidden.
 * Effective compat validation MUST use Pi precedence:
-  `modelOverrides[modelId].compat` > matching `models[].compat` > provider
-  `compat`. A write to a lower layer that remains shadowed by a conflicting
-  higher layer MUST fail self-check.
+  `modelOverrides[modelId].compat` > runtime model `compat` > matching
+  `models[].compat` > provider `compat`. Runtime-observed provider failures
+  MUST write the highest-precedence model override so extension-provided
+  runtime compat cannot shadow the repair. A write to a lower layer that
+  remains shadowed MUST fail self-check.
 * If the target already has a `modelOverrides[modelId]` entry, the fix MUST repair
   that highest-precedence entry directly. For a built-in/API-login model without
   a custom `models[]` entry, the fix MAY create a provider and/or compat-only
@@ -1255,8 +1259,9 @@ Safety contract:
   invent a custom `models[]` definition, API key, credential, base URL, or router
   slug.
 * Direct command execution and the interactive menu MUST call the same command
-  handler for Enable, Disable, Doctor, Stats, Compat, Fix, Footer mode, and Reset.
-  Security-sensitive transaction logic MUST NOT be duplicated in a menu-only path.
+  handler for Enable, Disable, Doctor, Stats, Compat, Fix, Rollback, Footer mode,
+  and Reset. Security-sensitive transaction logic MUST NOT be duplicated in a
+  menu-only path.
 
 #### Wrong vs correct: preserving `models.json` during fix
 
@@ -1281,6 +1286,39 @@ if (postCheckFailed) {
 }
 ```
 
+### `/cache-optimizer rollback`
+
+Rollback is available through native completion, direct execution, the interactive
+menu, and non-interactive guidance. Fix and rollback use an extension-owned
+cross-process exclusive-file transaction lease; stale recovery may unlink it only
+after checking owner PID plus file identity, and active live owners are never evicted
+only because a transaction runs longer than a timeout. It MUST require
+`ctx.ui.confirm`; without an
+interactive UI it refuses to write and points to the recorded backup for manual
+review. It uses the latest actionable receipt matching the active provider/model.
+
+A receipt is versioned and atomic and contains only a transaction id, exact
+provider/model identity, placement, whether the target existed before, changed
+scalar compat keys with before/after states, pre/post file hashes, a basename-only
+backup filename, timestamps, and rollback status. It MUST NOT contain credentials,
+secrets, prompts, payloads, headers, response bodies, or raw provider errors.
+
+Before confirmation, rollback validates that `models.json` is a regular file. If
+its hash equals the receipt post-fix hash and the receipt backup hashes to the
+pre-fix hash, rollback creates a new unique backup and atomically restores the
+exact pre-fix text. The original access mode is preserved for the new backup,
+replacement, and receipt.
+
+If the file hash differs, rollback MUST never replace the whole file. When the
+receipt target existed before the fix, it may surgically restore only receipt-owned
+scalar compat keys, and only while every owned key still equals its recorded
+post-fix value. It MUST refuse when a key changed, the target moved/disappeared,
+or the fix created a new target entry; the refusal includes manual backup guidance.
+The surgical result preserves comments, credentials, unrelated fields, and later
+user changes, is validated as JSONC, uses the same backup → temp → atomic rename
+contract, and marks the receipt rolled back only after successful validation.
+After any successful rollback, notify the user to run `/reload` or restart Pi.
+
 ### `/cache-optimizer reset`
 
 Resets the visible local footer stats for the active provider/model. This removes
@@ -1299,8 +1337,9 @@ session entries for that model; other provider/model totals are unaffected.
 ### No arguments
 
 When the Pi UI supports it (`ctx.ui.select` available), shows an interactive
-selection menu with options: Enable, Disable, Doctor, Stats, Compat, Fix, Reset,
-Footer mode is also available as a `Footer mode` item in this menu, with `total`,
+selection menu with options: Enable, Disable, Doctor, Stats, Compat, Fix,
+Rollback, Reset, and Cancel. Footer mode is also available as a `Footer mode`
+item in this menu, with `total`,
 `session`, and `process` choices. The explicit
 `config footer-mode total|session|process` command remains available for direct use.
 Selecting a menu subcommand executes the corresponding logic. Cancel closes the menu.
@@ -1385,7 +1424,7 @@ compat). It does NOT read or expose:
 | Scenario | Expected behavior |
 |---|---|
 | `/cache-optimizer doctor` with generic proxy missing session affinity | Output includes `Missing compat flags: sendSessionAffinityHeaders`, a copyable safe JSON suggestion with `sendSessionAffinityHeaders: true`, the configured agent-dir `models.json -> providers["<id>"]` path (default `~/.pi/agent/models.json`), optional/risky guidance for `supportsLongCacheRetention`, and credential-safe guidance that keeps existing authentication as-is while placing only compat overrides in `models.json` |
-| `/cache-optimizer doctor` with DeepSeek-like Pi Mono model missing reasoning compat | Output includes missing `requiresReasoningContentOnAssistantMessages` and `thinkingFormat`, plus copyable JSON with `requiresReasoningContentOnAssistantMessages: true` and `thinkingFormat: "deepseek"`. For `openai-responses`, it does not suggest removed `sendSessionIdHeader`; Pi 0.80.7+ owns header shape through `sessionAffinityFormat`. |
+| `/cache-optimizer doctor` with an explicitly configured DeepSeek-format `openai-completions` model missing replay compat | Output includes missing `requiresReasoningContentOnAssistantMessages` and a copyable JSON suggestion with only `requiresReasoningContentOnAssistantMessages: true`; it never lists or invents `thinkingFormat`. DeepSeek-named models with absent or explicit `openai`/`qwen`/`openrouter`/`together` formats retain only generic proxy diagnostics. |
 | Kimi Coding K3 custom `anthropic-messages` model missing adaptive compat | Footer/doctor/compat show missing `forceAdaptiveThinking` and `allowEmptySignature`; `/cache-optimizer fix` suggests both at model scope when sibling models are mixed. Moonshot/OpenRouter K3 variants on `openai-completions` remain in the Kimi/proxy path and do not receive Kimi Coding adaptive compat. |
 | `/cache-optimizer compat` with DeepSeek-like Pi Mono model missing reasoning compat | Shows the same DeepSeek-specific JSON suggestion and edit location; custom transports still show not-applicable. |
 | `/cache-optimizer doctor` without an active model | Notification: "No active model selected" |
@@ -1396,13 +1435,13 @@ compat). It does NOT read or expose:
 | `/cache-optimizer enable` | Runtime optimizer becomes enabled, `PI_CACHE_RETENTION=long` is requested, local footer stats/recent samples reset, footer republishes, and notification lists active feature states |
 | `/cache-optimizer disable` | Runtime optimizer becomes disabled for this Pi process, the process-original `PI_CACHE_RETENTION` is restored/unset even after extension reload, local footer stats/recent samples reset, adapter-matched footer shows `· Cache Optimizer disabled · <stats>`, and notification lists disabled feature states |
 | Runtime disabled before hooks fire | `before_agent_start` returns `{}`, `before_provider_request` does not add `prompt_cache_key`, `message_end` continues updating comparison stats, and session/model compat warnings are suppressed |
-| `/cache-optimizer` (no args) with UI supports select | Shows interactive selection menu (Enable / Disable / Doctor / Stats / Compat / Fix / Reset / Cancel); choosing Fix executes the same confirmed backup/write/self-check contract as direct `/cache-optimizer fix` |
-| `/cache-optimizer` (no args) without UI | Text help lists `enable`, `disable`, `doctor`, `stats`, `compat`, `reset` subcommands plus runtime state |
+| `/cache-optimizer` (no args) with UI supports select | Shows interactive selection menu (Enable / Disable / Doctor / Stats / Compat / Fix / Rollback / Reset / Cancel); choosing Fix or Rollback executes the same confirmed transaction handler as direct invocation |
+| `/cache-optimizer` (no args) without UI | Text help lists `enable`, `disable`, `doctor`, `stats`, `compat`, `fix`, `rollback`, and `reset` subcommands plus runtime state |
 | Footer status for generic proxy after `/cache-optimizer fix` added `sendSessionAffinityHeaders` but `supportsLongCacheRetention` remains absent | No `⚠️ compat`; doctor/compat may still show optional long-retention guidance, but the model is considered safely configured |
 | Every non-empty extension footer status | Begins with `· `, including disabled-mode, router-restored, integrity-warning, and compat-warning variants; other extension statuses remain visibly separated |
-| `/cache-optimizer` argument completion | Native `getArgumentCompletions` offers top-level commands, `config`, `config footer-mode`, and `total`/`session`/`process`, filters by prefix, tolerates surrounding whitespace, and returns `null` for unknown prefixes |
+| `/cache-optimizer` argument completion | Native `getArgumentCompletions` offers top-level commands including `rollback`, `config`, `config footer-mode`, and `total`/`session`/`process`, filters by prefix, tolerates surrounding whitespace, and returns `null` for unknown prefixes |
 | Footer status when compat is fixed or model changes | `⚠️ compat` marker clears |
-| `/cache-optimizer fix` with API-logged-in model not in models.json (interactive UI) | Analyzes models.json, shows a preview of a compat-only `modelOverrides[modelId]` entry, confirms, writes atomically with backup, validates the effective three-layer result, and succeeds |
+| `/cache-optimizer fix` with API-logged-in model not in models.json (interactive UI) | Analyzes models.json, shows a preview of a compat-only `modelOverrides[modelId]` entry, confirms, writes atomically with backup, validates the full provider/model/runtime/modelOverride result, and succeeds |
 | `/cache-optimizer fix` with API-logged-in model not in models.json (non-interactive) | Shows manual guidance with complete JSON snippet, keeps existing auth as-is, includes fallback for both missing-provider and missing-model scenarios |
 | Direct `/cache-optimizer fix` and no-args menu Fix | Both paths call the same command handler. Permanent command-level tests run both against a temporary `PI_CODING_AGENT_DIR`, require confirmation, compare the unique backup byte-for-byte, preserve the original access mode, parse the written JSONC, validate effective modelOverrides compat, and assert comments/credentials/unrelated fields remain unchanged |
 | `/cache-optimizer fix` creates new provider entry in models.json | Does NOT create API keys, credentials, baseUrl, router slugs, or a custom `models[]` definition; only inserts a minimal compat-only `modelOverrides` structure |

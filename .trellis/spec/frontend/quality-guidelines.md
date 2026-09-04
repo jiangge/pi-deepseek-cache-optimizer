@@ -57,7 +57,7 @@ python3 ./.trellis/scripts/task.py validate .trellis/tasks/<task>
 ## Forbidden Patterns
 
 - Logging or persisting API keys, prompts, payloads, headers, response bodies, raw session ids, or model outputs.
-- Writing `models.json` outside the explicit `/cache-optimizer fix` confirmation flow.
+- Writing `models.json` outside the explicit `/cache-optimizer fix` or `/cache-optimizer rollback` confirmation flows.
 - Changing the existing `models.json` access mode during fix/backup/rollback; preserve it exactly rather than enforcing a preferred mode.
 - In-place writes or rollbacks to stats/config/models files when atomic temp + rename is required.
 - Adapter selection by provider id, API type, base URL, or compat flags.

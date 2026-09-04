@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { describe, test } from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -170,7 +170,7 @@ describe("footer status separation and command completion", () => {
   test("completes top-level and nested cache-optimizer arguments by prefix", () => {
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions(""),
-      ["enable", "disable", "doctor", "stats", "config", "compat", "reset", "fix"].map((value) => ({ value, label: value })),
+      ["enable", "disable", "doctor", "stats", "config", "compat", "reset", "fix", "rollback"].map((value) => ({ value, label: value })),
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions(" c "),
@@ -1185,6 +1185,172 @@ describe("modelOverrides JSONC fixes", () => {
     );
   });
 
+  test("self-check includes runtime compat and requires a higher-precedence override", () => {
+    const original = `{
+  "providers": {
+    "proxy": {
+      "models": [{
+        "id": "builtin-model",
+        "compat": { "thinkingFormat": "deepseek" }
+      }]
+    }
+  }
+}`;
+    const runtimeModel = {
+      provider,
+      id: modelId,
+      name: "DeepSeek Builtin",
+      api: "openai-completions",
+      baseUrl: "https://proxy.example/v1",
+      compat: { thinkingFormat: "deepseek" },
+    } as any;
+    const location = internals.locateModelInJsonc(original, provider, modelId);
+    assert.ok(location);
+    const lowerLayer = internals.composeFixInsertion(
+      original,
+      location,
+      { thinkingFormat: "openai" },
+      "model",
+    );
+    assert.match(
+      internals.selfCheckFix(
+        original,
+        lowerLayer,
+        provider,
+        modelId,
+        { thinkingFormat: "openai" },
+        "model",
+        runtimeModel,
+      ) ?? "",
+      /effective compat\.thinkingFormat has wrong value/,
+    );
+
+    const override = internals.composeModelOverrideInsertion(
+      original,
+      provider,
+      modelId,
+      { thinkingFormat: "openai" },
+    );
+    assert.ok(override);
+    assert.equal(
+      internals.selfCheckMissingEntryInsertion(
+        original,
+        override.modifiedText,
+        provider,
+        modelId,
+        { thinkingFormat: "openai" },
+        runtimeModel,
+      ),
+      null,
+    );
+    assert.equal(
+      internals.resolveEffectiveCompatFromConfig(
+        runtimeModel,
+        internals.parseJsonc(override.modifiedText),
+      ).thinkingFormat,
+      "openai",
+    );
+  });
+
+  test("refuses ambiguous duplicate JSONC path keys before editing", () => {
+    const model = `"models": [{ "id": "builtin-model", "compat": { "supportsLongCacheRetention": false } }]`;
+    const providerEntry = `"proxy": { ${model} }`;
+    const cases = [
+      `{
+  "providers": { ${providerEntry} },
+  "providers": { ${providerEntry} }
+}`,
+      `{
+  "providers": { ${providerEntry}, ${providerEntry} }
+}`,
+      `{
+  "providers": { "proxy": { ${model}, ${model} } }
+}`,
+      `{
+  "providers": { "proxy": {
+    ${model},
+    "modelOverrides": { "builtin-model": { "compat": { "supportsLongCacheRetention": false } } },
+    "modelOverrides": { "builtin-model": { "compat": { "supportsLongCacheRetention": false } } }
+  } }
+}`,
+      `{
+  "providers": { "proxy": {
+    ${model},
+    "modelOverrides": {
+      "builtin-model": { "compat": { "supportsLongCacheRetention": false } },
+      "builtin-model": { "compat": { "supportsLongCacheRetention": false } }
+    }
+  } }
+}`,
+      `{
+  "providers": { "proxy": {
+    "compat": { "providerOnly": false },
+    "compat": { "providerOnly": true },
+    ${model}
+  } }
+}`,
+      `{
+  "providers": { "proxy": {
+    ${model},
+    "modelOverrides": {
+      "builtin-model": {
+        "compat": { "supportsLongCacheRetention": false },
+        "compat": { "supportsLongCacheRetention": true }
+      }
+    }
+  } }
+}`,
+      `{
+  "providers": { "proxy": {
+    "models": [{ "id": "builtin-model", "compat": { "supportsLongCacheRetention": false }, "compat": { "supportsLongCacheRetention": false } }]
+  } }
+}`,
+      `{
+  "providers": { "proxy": {
+    "models": [{ "id": "builtin-model", "id": "builtin-model", "compat": { "supportsLongCacheRetention": false } }]
+  } }
+}`,
+    ];
+
+    for (const text of cases) {
+      assert.equal(internals.locateModelInJsonc(text, provider, modelId), undefined);
+      assert.equal(internals.analyzeModelsJsonForMissingEntry(text, provider, modelId), undefined);
+    }
+  });
+
+  test("self-check rejects unrelated additions instead of accepting a one-way subset", () => {
+    const original = `{
+  "providers": {
+    "proxy": {
+      "models": [{ "id": "builtin-model" }]
+    }
+  }
+}`;
+    const location = internals.locateModelInJsonc(original, provider, modelId);
+    assert.ok(location);
+    const modified = internals.composeFixInsertion(
+      original,
+      location,
+      { sendSessionAffinityHeaders: true },
+      "model",
+    );
+    const withUnrelatedSecret = modified.replace(
+      '"models":',
+      '"apiKey": "env:SHOULD_NOT_BE_ADDED",\n      "models":',
+    );
+    assert.match(
+      internals.selfCheckFix(
+        original,
+        withUnrelatedSecret,
+        provider,
+        modelId,
+        { sendSessionAffinityHeaders: true },
+        "model",
+      ) ?? "",
+      /original structure was altered/,
+    );
+  });
+
   test("creates only a modelOverrides entry for a built-in model", () => {
     const original = `{
   "providers": {
@@ -1254,6 +1420,402 @@ describe("modelOverrides JSONC fixes", () => {
       ),
       { source: "modelOverride", value: true },
     );
+  });
+});
+
+describe("DeepSeek protocol-first compatibility", () => {
+  const model = (compat: Record<string, unknown> = {}, overrides: Partial<Record<string, unknown>> = {}) => ({
+    provider: "amd-radeon",
+    id: "DeepSeek-V4-Flash",
+    name: "DeepSeek V4 Flash",
+    api: "openai-completions",
+    baseUrl: "https://developer.amd.com.cn/radeon/api/v1",
+    compat,
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000,
+    maxTokens: 8192,
+    ...overrides,
+  }) as any;
+
+  test("does not infer DeepSeek wire protocol from the family name or reasoning effort support", () => {
+    const current = model({ supportsReasoningEffort: true });
+    assert.equal(internals.isDeepSeekWireCompatApplicable(current), false);
+    assert.deepEqual(internals.describeMissingDeepSeekCompat(current), []);
+    assert.deepEqual(internals.buildDeepSeekCompatSuggestion(["sendSessionAffinityHeaders"]), {
+      sendSessionAffinityHeaders: true,
+    });
+    assert.doesNotMatch(
+      internals.buildOpenAIProxyCompatWarningText("amd-radeon/DeepSeek-V4-Flash", ["sendSessionAffinityHeaders"]),
+      /thinkingFormat|requiresReasoningContent/,
+    );
+  });
+
+  test("keeps generic proxy diagnostics for absent and explicit non-DeepSeek formats", () => {
+    for (const thinkingFormat of [undefined, "openai", "qwen", "openrouter", "together"]) {
+      const current = model({ supportsReasoningEffort: true, ...(thinkingFormat ? { thinkingFormat } : {}) });
+      assert.equal(internals.isDeepSeekWireCompatApplicable(current), false);
+      assert.deepEqual(internals.describeMissingDeepSeekCompat(current), []);
+      assert.deepEqual(internals.describeMissingCacheCompatForModel(current), ["sendSessionAffinityHeaders"]);
+      const suggestion = internals.buildFixSuggestion(current);
+      assert.deepEqual(suggestion?.compatKeys, { sendSessionAffinityHeaders: true });
+      assert.doesNotMatch(JSON.stringify(suggestion), /thinkingFormat|requiresReasoningContent/);
+    }
+  });
+
+  test("uses explicit DeepSeek format only for replay diagnostics and never lists the format itself", () => {
+    const current = model({ thinkingFormat: "deepseek", supportsReasoningEffort: true });
+    assert.equal(internals.isDeepSeekWireCompatApplicable(current), true);
+    assert.deepEqual(internals.describeMissingDeepSeekCompat(current), ["requiresReasoningContentOnAssistantMessages"]);
+    assert.deepEqual(internals.describeMissingCacheCompatForModel(current), [
+      "sendSessionAffinityHeaders",
+      "requiresReasoningContentOnAssistantMessages",
+    ]);
+    const suggestion = internals.buildFixSuggestion(current);
+    assert.deepEqual(suggestion?.compatKeys, {
+      sendSessionAffinityHeaders: true,
+      requiresReasoningContentOnAssistantMessages: true,
+    });
+    assert.doesNotMatch(JSON.stringify(suggestion), /thinkingFormat/);
+  });
+
+  test("requires explicit error evidence before proposing a model-scoped protocol repair", () => {
+    const current = model({ thinkingFormat: "deepseek", supportsReasoningEffort: true });
+    assert.equal(internals.buildReasoningProtocolFixSuggestion(current), undefined);
+    assert.deepEqual(internals.buildReasoningProtocolFixSuggestion(
+      model({
+        thinkingFormat: "deepseek",
+        supportsReasoningEffort: true,
+        requiresReasoningContentOnAssistantMessages: true,
+      }),
+      true,
+    )?.compatKeys, {
+      thinkingFormat: "openai",
+      requiresReasoningContentOnAssistantMessages: false,
+    });
+    assert.equal(internals.hasReasoningProtocolRejectionText(
+      '400 Unsupported parameter: thinking. Use reasoning_effort instead.',
+    ), true);
+    assert.equal(internals.hasReasoningProtocolRejectionText(
+      '400 Unsupported parameter: reasoning_effort. Use thinking instead.',
+    ), false);
+    for (const message of [
+      '400 Invalid parameter: thinking. Use reasoning_effort instead.',
+      'thinking is not accepted; reasoning_effort is required.',
+      'thinking is disallowed; please use reasoning_effort.',
+      'thinking is not a valid field; set reasoning_effort.',
+      'thinking is rejected; replace thinking with reasoning_effort.',
+    ]) {
+      assert.equal(internals.hasReasoningProtocolRejectionText(message), true, message);
+    }
+    for (const message of [
+      '400 Invalid parameter: reasoning_effort. Use thinking instead.',
+      'reasoning_effort is not accepted; use thinking instead.',
+      'thinking is unsupported; reasoning_effort should not be used either.',
+      'thinking is unsupported; reasoning_effort is supported but disabled for this account.',
+      'thinking is unsupported; reasoning_effort must not be sent.',
+      'thinking is unsupported; do not use reasoning_effort.',
+      'thinking is unsupported; reasoning_effort is not required.',
+      'thinking is unsupported! do not use reasoning_effort.',
+      'The docs mention thinking and reasoning_effort, but no parameter was rejected.',
+    ]) {
+      assert.equal(internals.hasReasoningProtocolRejectionText(message), false, message);
+    }
+    assert.equal(internals.hasReasoningProtocolRejectionSignal({
+      "x-provider-error": "thinking is unsupported",
+      "x-provider-doc": "use reasoning_effort for a different endpoint",
+    }), false);
+    assert.equal(internals.hasReasoningProtocolRejectionSignal({
+      "x-provider-error": "thinking is unsupported; use reasoning_effort instead",
+    }), true);
+
+    const protocolFix = internals.buildReasoningProtocolFixSuggestion(current);
+    assert.equal(protocolFix, undefined);
+    for (const thinkingFormat of ["qwen", "openrouter", "together"]) {
+      assert.equal(
+        internals.buildReasoningProtocolFixSuggestion(model({ thinkingFormat }), true),
+        undefined,
+        thinkingFormat,
+      );
+    }
+    assert.equal(internals.buildReasoningProtocolFixSuggestion(model({ thinkingFormat: "openai" }), true)?.compatKeys.thinkingFormat, undefined);
+    assert.equal(internals.isReasoningProtocolRejectionSignalApplicable(current), true);
+  });
+
+  test("matches only the exact model identity for finalized assistant evidence", () => {
+    const current = model();
+    const matching = {
+      role: "assistant",
+      provider: current.provider,
+      model: current.id,
+      status: 400,
+      stopReason: "error",
+      errorMessage: 'Unsupported parameter: thinking; use reasoning_effort instead.',
+    };
+    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage(matching), true);
+    assert.equal(internals.isReasoningProtocolRejectionForModel(matching, current), true);
+    assert.equal(
+      internals.hasReasoningProtocolRejectionErrorMessage({ ...matching, status: 422 }),
+      false,
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionErrorMessage({ ...matching, status: undefined }),
+      false,
+    );
+    assert.equal(internals.isReasoningProtocolRejectionForModel({ ...matching, model: "DeepSeek-V4-Other" }, current), false);
+    assert.equal(internals.isReasoningProtocolRejectionForModel({ ...matching, provider: "other" }, current), false);
+    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({ ...matching, stopReason: "stop" }), false);
+    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({
+      ...matching,
+      status: undefined,
+      errorMessage: "400: Unsupported parameter: thinking. Use reasoning_effort instead.",
+    }), true);
+    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({
+      ...matching,
+      status: undefined,
+      diagnostics: [{ details: { statusCode: 400 } }],
+    }), true);
+    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({
+      ...matching,
+      status: undefined,
+      details: { error: { httpStatus: 400 } },
+    }), true);
+    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({
+      ...matching,
+      status: undefined,
+      diagnostics: [{ details: { statusCode: 422 } }],
+    }), false);
+    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({
+      ...matching,
+      status: undefined,
+      errorMessage: "DeepSeek model: 422 Unsupported parameter: thinking. Use reasoning_effort instead.",
+    }), false);
+    assert.equal(internals.hasReasoningProtocolRejectionText(
+      "Unsupported parameter: thinking. reasoning_effort is unsupported.",
+    ), false);
+  });
+
+  test("correlates response-header evidence with the request model, not a later selection", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-reasoning-correlation-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousRetention = process.env.PI_CACHE_RETENTION;
+    const modelsPath = join(tempAgentDir, "models.json");
+    const config = {
+      providers: {
+        "proxy-a": {
+          baseUrl: "https://proxy-a.example/v1",
+          models: [{ id: "deepseek-a", name: "DeepSeek A" }],
+        },
+        "proxy-b": {
+          baseUrl: "https://proxy-b.example/v1",
+          models: [{ id: "deepseek-b", name: "DeepSeek B" }],
+        },
+      },
+    };
+
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      await writeFile(modelsPath, JSON.stringify(config), "utf8");
+      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
+        interopDefault: false,
+        moduleCache: false,
+      });
+      const freshModule = await jiti.import<typeof import("../index.ts")>(
+        join(process.cwd(), "index.ts"),
+      );
+      const handlers = new Map<string, (event: any, context: any) => unknown>();
+      const commands = new Map<string, { handler: (args: string, context: any) => Promise<void> }>();
+      freshModule.default({
+        on(name: string, handler: (event: any, context: any) => unknown) {
+          handlers.set(name, handler);
+        },
+        registerCommand(name: string, command: { handler: (args: string, context: any) => Promise<void> }) {
+          commands.set(name, command);
+        },
+      } as any);
+
+      const makeModel = (provider: string, id: string, name: string) => ({
+        provider,
+        id,
+        name,
+        api: "openai-completions",
+        baseUrl: `https://${provider}.example/v1`,
+        compat: {},
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128_000,
+        maxTokens: 8192,
+      });
+      const modelA = makeModel("proxy-a", "deepseek-a", "DeepSeek A");
+      const modelB = makeModel("proxy-b", "deepseek-b", "DeepSeek B");
+      const notifications: string[] = [];
+      const baseContext = {
+        sessionManager: { getSessionId: () => "reasoning-correlation-session" },
+        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        ui: {
+          notify: (message: string) => notifications.push(message),
+          setStatus() {},
+          confirm: async () => false,
+        },
+      };
+      const requestHook = handlers.get("before_provider_request");
+      const responseHook = handlers.get("after_provider_response");
+      const messageEndHook = handlers.get("message_end");
+      const command = commands.get("cache-optimizer");
+      assert.ok(requestHook);
+      assert.ok(responseHook);
+      assert.ok(messageEndHook);
+      assert.ok(command);
+
+      requestHook(
+        { payload: {} },
+        { ...baseContext, model: modelA },
+      );
+      await responseHook(
+        {
+          status: 400,
+          headers: { "x-provider-error": "Unsupported parameter: thinking. Use reasoning_effort instead." },
+        },
+        { ...baseContext, model: modelB },
+      );
+
+      assert.ok(notifications.some((message) => message.includes("proxy-a/deepseek-a")));
+      assert.equal(notifications.some((message) => message.includes("Unsupported parameter")), false);
+
+      await command.handler("fix", {
+        ...baseContext,
+        model: modelA,
+        hasUI: false,
+        ui: { ...baseContext.ui, notify: (message: string) => notifications.push(message) },
+      });
+      const modelAFixGuidance = notifications.at(-1) ?? "";
+      assert.match(modelAFixGuidance, /thinkingFormat/);
+
+      await command.handler("fix", {
+        ...baseContext,
+        model: modelB,
+        hasUI: false,
+        ui: { ...baseContext.ui, notify: (message: string) => notifications.push(message) },
+      });
+      const modelBFixGuidance = notifications.at(-1) ?? "";
+      assert.doesNotMatch(modelBFixGuidance, /thinkingFormat/);
+
+      // A finalized assistant error may arrive without provider/model fields.
+      // Keep its request-local identity even when the active model has changed.
+      const modelC = makeModel("proxy-c", "deepseek-c", "DeepSeek C");
+      const notificationCountBeforeMessage = notifications.length;
+      requestHook(
+        { payload: {} },
+        { ...baseContext, model: modelC },
+      );
+      await messageEndHook(
+        {
+          message: {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: "400: Unsupported parameter: thinking. Use reasoning_effort instead.",
+          },
+        },
+        { ...baseContext, model: modelB },
+      );
+      const newNotifications = notifications.slice(notificationCountBeforeMessage);
+      assert.ok(newNotifications.some((message) => message.includes("proxy-c/deepseek-c")));
+      assert.equal(newNotifications.some((message) => message.includes("proxy-b/deepseek-b")), false);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      else process.env.PI_CACHE_RETENTION = previousRetention;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
+  test("evidence-driven command fix overrides extension runtime compat at modelOverrides", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-runtime-compat-fix-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousRetention = process.env.PI_CACHE_RETENTION;
+    const modelsPath = join(tempAgentDir, "models.json");
+    const original = `{
+  "providers": {
+    "runtime-shadow-proxy": {
+      "baseUrl": "https://proxy.example/v1",
+      "models": [{
+        "id": "deepseek-runtime-shadow",
+        "compat": { "thinkingFormat": "deepseek" }
+      }]
+    }
+  }
+}`;
+
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      await writeFile(modelsPath, original, { encoding: "utf8", mode: 0o600 });
+      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
+        interopDefault: false,
+        moduleCache: false,
+      });
+      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const handlers = new Map<string, (event: any, context: any) => unknown>();
+      const commands = new Map<string, { handler: (args: string, context: any) => Promise<void> }>();
+      freshModule.default({
+        on(name: string, handler: (event: any, context: any) => unknown) {
+          handlers.set(name, handler);
+        },
+        registerCommand(name: string, command: { handler: (args: string, context: any) => Promise<void> }) {
+          commands.set(name, command);
+        },
+      } as any);
+      const modelWithRuntimeCompat = {
+        provider: "runtime-shadow-proxy",
+        id: "deepseek-runtime-shadow",
+        name: "DeepSeek Runtime Shadow",
+        api: "openai-completions",
+        baseUrl: "https://proxy.example/v1",
+        compat: { thinkingFormat: "deepseek" },
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128_000,
+        maxTokens: 8192,
+      } as any;
+      const notifications: string[] = [];
+      const context = {
+        model: modelWithRuntimeCompat,
+        hasUI: true,
+        sessionManager: { getSessionId: () => "runtime-shadow-session" },
+        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        ui: {
+          confirm: async () => true,
+          notify: (message: string) => notifications.push(message),
+          setStatus() {},
+        },
+      };
+      handlers.get("before_provider_request")?.({ payload: {} }, context);
+      await handlers.get("after_provider_response")?.({
+        status: 400,
+        headers: { "x-provider-error": "thinking is unsupported; use reasoning_effort instead" },
+      }, context);
+      await commands.get("cache-optimizer")?.handler("fix", context);
+
+      const parsed = freshModule.__internals_for_tests.parseJsonc(await readFile(modelsPath, "utf8")) as any;
+      assert.equal(
+        parsed.providers[modelWithRuntimeCompat.provider].modelOverrides[modelWithRuntimeCompat.id].compat.thinkingFormat,
+        "openai",
+      );
+      assert.equal(
+        freshModule.__internals_for_tests.resolveEffectiveCompatFromConfig(modelWithRuntimeCompat, parsed).thinkingFormat,
+        "openai",
+      );
+      assert.ok(notifications.some((message) => message.includes("Fix applied")));
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      else process.env.PI_CACHE_RETENTION = previousRetention;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1378,16 +1940,25 @@ describe("/cache-optimizer fix command", () => {
             "deepseek-v4",
             "supportsLongCacheRetention",
           ),
-          { source: "modelOverride", value: true },
+          { source: "modelOverride", value: false },
         );
         assert.deepEqual(
           freshModule.__internals_for_tests.resolveExplicitCompatValue(
             parsed,
             "proxy",
             "deepseek-v4",
+            "sendSessionAffinityHeaders",
+          ),
+          { source: "modelOverride", value: true },
+        );
+        assert.equal(
+          freshModule.__internals_for_tests.resolveExplicitCompatValue(
+            parsed,
+            "proxy",
+            "deepseek-v4",
             "thinkingFormat",
           ),
-          { source: "modelOverride", value: "deepseek" },
+          undefined,
         );
         assert.match(written, /\/\/ Credential and endpoint configuration must survive the fix\./);
         assert.equal(parsed.providers.proxy.apiKey, "env:PROXY_API_KEY");
@@ -1413,9 +1984,24 @@ describe("/cache-optimizer fix command", () => {
       await command.handler("", commandContext);
       assert.equal(menuPrompts.length, 1);
       assert.ok(menuPrompts[0].options.includes(menuChoice));
+      assert.ok(menuPrompts[0].options.includes("Rollback — Undo the latest confirmed fix"));
       const menuBackup = await assertApplied(0o644);
       assert.equal((await stat(join(tempAgentDir, menuBackup))).mode & 0o7777, 0o644);
       assert.equal((await stat(modelsPath)).mode & 0o7777, 0o644);
+
+      confirmations.length = 0;
+      menuChoice = "Rollback — Undo the latest confirmed fix";
+      await command.handler("", commandContext);
+      assert.equal(confirmations.filter(({ title }) => /Rollback/.test(title)).length, 1);
+      assert.equal(await readFile(modelsPath, "utf8"), original);
+
+      const helpMessages: string[] = [];
+      await command.handler("", {
+        ...commandContext,
+        hasUI: false,
+        ui: { ...commandContext.ui, notify: (message: string) => helpMessages.push(message) },
+      });
+      assert.match(helpMessages.at(-1) ?? "", /rollback.*requires UI confirmation/i);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -1423,6 +2009,54 @@ describe("/cache-optimizer fix command", () => {
       else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
+  });
+
+  test("receipt captures only scalar fix metadata and exact hash relationships", async () => {
+    const original = `{
+  "providers": {
+    "proxy": {
+      "apiKey": "env:SECRET",
+      "models": [{ "id": "deepseek-v4", "compat": { "sendSessionAffinityHeaders": false } }]
+    }
+  }
+}`;
+    const modified = original.replace('"sendSessionAffinityHeaders": false', '"sendSessionAffinityHeaders": true');
+    const receipt = internals.createModelsJsonFixReceipt(
+      original,
+      modified,
+      "proxy",
+      "deepseek-v4",
+      "model",
+      { sendSessionAffinityHeaders: true },
+      true,
+      "/tmp/models.json.backup-cache-optimizer-receipt-test",
+      1_700_000_000_000,
+    );
+    assert.ok(receipt);
+    assert.equal(receipt.beforeHash, internals.hashText(original));
+    assert.equal(receipt.afterHash, internals.hashText(modified));
+    assert.deepEqual(receipt.changedKeys, {
+      sendSessionAffinityHeaders: {
+        before: { present: true, value: false },
+        after: { present: true, value: true },
+      },
+    });
+    assert.equal("apiKey" in receipt, false);
+    assert.equal(JSON.stringify(receipt).includes("SECRET"), false);
+    assert.equal(JSON.stringify(receipt).includes("prompt"), false);
+    assert.equal(JSON.stringify(receipt).includes("payload"), false);
+    assert.equal(
+      internals.parseModelsJsonFixReceipt({
+        ...receipt,
+        changedKeys: {
+          apiKey: {
+            before: { present: false },
+            after: { present: true, value: "env:SECRET" },
+          },
+        },
+      }),
+      undefined,
+    );
   });
 
   test("transaction rollback restores original content and access mode", async () => {
@@ -1465,6 +2099,88 @@ describe("/cache-optimizer fix command", () => {
     }
   });
 
+  test("rollback restores receipt-owned keys surgically and preserves later changes", () => {
+    const original = `{
+  "providers": {
+    "proxy": {
+      "models": [{ "id": "deepseek-v4", "compat": { "sendSessionAffinityHeaders": false } }]
+    }
+  }
+}`;
+    const fixed = original.replace('"sendSessionAffinityHeaders": false', '"sendSessionAffinityHeaders": true');
+    const receipt = internals.createModelsJsonFixReceipt(
+      original,
+      fixed,
+      "proxy",
+      "deepseek-v4",
+      "model",
+      { sendSessionAffinityHeaders: true },
+      true,
+      "/tmp/models.json.backup-cache-optimizer-surgical-test",
+      1_700_000_000_000,
+    );
+    assert.ok(receipt);
+    const later = fixed.replace('"sendSessionAffinityHeaders": true', '"sendSessionAffinityHeaders": true,\n      "later": "keep"');
+    const rollback = internals.composeModelsJsonReceiptRollback(later, receipt);
+    assert.equal("error" in rollback, false);
+    if (!("error" in rollback)) {
+      assert.match(rollback.modifiedText, /"sendSessionAffinityHeaders": false/);
+      assert.match(rollback.modifiedText, /"later": "keep"/);
+      assert.equal(internals.validateModelsJsonRollback(rollback.modifiedText, receipt), null);
+    }
+
+    const changedOwnedKey = later.replace('"sendSessionAffinityHeaders": true', '"sendSessionAffinityHeaders": false');
+    assert.match(
+      "error" in internals.composeModelsJsonReceiptRollback(changedOwnedKey, receipt)
+        ? (internals.composeModelsJsonReceiptRollback(changedOwnedKey, receipt) as { error: string }).error
+        : "",
+      /changed after the fix/,
+    );
+
+    const removedTarget = later.replace('"deepseek-v4"', '"renamed-after-fix"');
+    assert.match(
+      "error" in internals.composeModelsJsonReceiptRollback(removedTarget, receipt)
+        ? (internals.composeModelsJsonReceiptRollback(removedTarget, receipt) as { error: string }).error
+        : "",
+      /(?:could not locate receipt target|target entry is missing)/i,
+    );
+
+    const createdTargetOriginal = `{
+  "providers": {
+    "proxy": { "models": [{ "id": "deepseek-v4" }] }
+  }
+}`;
+    const createdTargetFixed = `{
+  "providers": {
+    "proxy": {
+      "models": [{ "id": "deepseek-v4" }],
+      "modelOverrides": {
+        "deepseek-v4": { "compat": { "sendSessionAffinityHeaders": true } }
+      }
+    }
+  }
+}`;
+    const createdTargetReceipt = internals.createModelsJsonFixReceipt(
+      createdTargetOriginal,
+      createdTargetFixed,
+      "proxy",
+      "deepseek-v4",
+      "modelOverride",
+      { sendSessionAffinityHeaders: true },
+      false,
+      "/tmp/models.json.backup-cache-optimizer-created-target-test",
+      1_700_000_000_000,
+    );
+    assert.ok(createdTargetReceipt);
+    const createdTargetChanged = createdTargetFixed.replace('"models":', '"later": "keep",\n      "models":');
+    assert.match(
+      "error" in internals.composeModelsJsonReceiptRollback(createdTargetChanged, createdTargetReceipt)
+        ? (internals.composeModelsJsonReceiptRollback(createdTargetChanged, createdTargetReceipt) as { error: string }).error
+        : "",
+      /created (?:a )?new target entry/,
+    );
+  });
+
   test("refuses to overwrite an existing backup or modify models.json", async () => {
     const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-exclusive-backup-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -1496,6 +2212,449 @@ describe("/cache-optimizer fix command", () => {
       assert.equal(await readFile(modelsPath, "utf8"), original);
       assert.equal((await stat(modelsPath)).mode & 0o7777, 0o600);
       assert.equal(await readFile(backupPath, "utf8"), "do-not-overwrite");
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses symlinked transaction paths and expected-hash races", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-symlink-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const modelsPath = join(tempAgentDir, "models.json");
+    const targetPath = join(tempAgentDir, "models-target.json");
+    const backupPath = join(tempAgentDir, "models.json.backup-cache-optimizer-symlink");
+    const original = `{"providers": {}}\n`;
+
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      await writeFile(targetPath, original, "utf8");
+      await symlink(targetPath, modelsPath);
+      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
+        interopDefault: false,
+        moduleCache: false,
+      });
+      const freshModule = await jiti.import<typeof import("../index.ts")>(
+        join(process.cwd(), "index.ts"),
+      );
+
+      assert.equal((await lstat(modelsPath)).isSymbolicLink(), true);
+      await assert.rejects(
+        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
+          `{"providers": {"proxy": {}}}\n`,
+          backupPath,
+          () => null,
+          { expectedCurrentHash: freshModule.__internals_for_tests.hashText(original) },
+        ),
+        /not a regular file/,
+      );
+      assert.equal(await readFile(targetPath, "utf8"), original);
+
+      await rm(modelsPath, { force: true });
+      await writeFile(modelsPath, original, "utf8");
+      const backupTarget = join(tempAgentDir, "backup-target.json");
+      await writeFile(backupTarget, original, "utf8");
+      await symlink(backupTarget, backupPath);
+      await assert.rejects(
+        freshModule.__internals_for_tests.atomicRestoreFileFromBackup(backupPath, modelsPath, 0o600),
+        /backup is not a regular file/,
+      );
+      assert.equal(await readFile(modelsPath, "utf8"), original);
+
+      await rm(backupPath, { force: true });
+      await assert.rejects(
+        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
+          `{"providers": {"proxy": {}}}\n`,
+          backupPath,
+          () => null,
+          { expectedCurrentHash: freshModule.__internals_for_tests.hashText("different") },
+        ),
+        /changed since the fix preview/,
+      );
+      assert.equal(await readFile(modelsPath, "utf8"), original);
+
+      await chmod(modelsPath, 0o640);
+      await assert.rejects(
+        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
+          `{"providers": {"proxy": {}}}\n`,
+          join(tempAgentDir, "models.json.backup-cache-optimizer-mode-race"),
+          () => null,
+          {
+            expectedCurrentHash: freshModule.__internals_for_tests.hashText(original),
+            expectedCurrentMode: 0o600,
+          },
+        ),
+        /access mode changed since the fix preview/,
+      );
+      assert.equal(await readFile(modelsPath, "utf8"), original);
+      assert.equal((await stat(modelsPath)).mode & 0o7777, 0o640);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects real target swaps at the final atomic rename boundary", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-final-rename-race-test-"));
+    const targetPath = join(tempDir, "models.json");
+    const backupPath = join(tempDir, "models.json.backup-cache-optimizer-race");
+    const original = '{"providers":{"a":{}}}\n';
+    const replacement = '{"providers":{"b":{}}}\n';
+    const external = '{"providers":{"external":{}}}\n';
+    try {
+      await writeFile(targetPath, original, { encoding: "utf8", mode: 0o600 });
+      await writeFile(backupPath, original, { encoding: "utf8", mode: 0o600 });
+      await assert.rejects(
+        internals.atomicReplaceTextFilePreservingMode(
+          targetPath,
+          replacement,
+          0o600,
+          "fix-race-test",
+          { hash: internals.hashText(original), mode: 0o600 },
+          async () => {
+            await writeFile(targetPath, external, { encoding: "utf8", mode: 0o600 });
+          },
+        ),
+        /target content changed during atomic replacement/,
+      );
+      assert.equal(await readFile(targetPath, "utf8"), external);
+
+      await writeFile(targetPath, replacement, { encoding: "utf8", mode: 0o600 });
+      await assert.rejects(
+        internals.atomicRestoreFileFromBackup(
+          backupPath,
+          targetPath,
+          0o600,
+          { hash: internals.hashText(replacement), mode: 0o600, backupHash: internals.hashText(original) },
+          async () => {
+            await writeFile(targetPath, external, { encoding: "utf8", mode: 0o600 });
+          },
+        ),
+        /target content changed during atomic replacement/,
+      );
+      assert.equal(await readFile(targetPath, "utf8"), external);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("models.json transactions serialize across concurrent Pi instances", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-transaction-lock-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const modelsPath = join(tempAgentDir, "models.json");
+    const original = `{"providers":{}}\n`;
+
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      await writeFile(modelsPath, original, { encoding: "utf8", mode: 0o600 });
+      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
+        interopDefault: false,
+        moduleCache: false,
+      });
+      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      let releaseFirst!: () => void;
+      const firstCommitted = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      let firstEntered!: () => void;
+      const firstStarted = new Promise<void>((resolve) => { firstEntered = resolve; });
+      const hash = freshModule.__internals_for_tests.hashText(original);
+      const first = freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
+        `{"providers":{"first":{}}}\n`,
+        join(tempAgentDir, "models.json.backup-cache-optimizer-lock-first"),
+        () => null,
+        {
+          expectedCurrentHash: hash,
+          onCommitted: async () => {
+            firstEntered();
+            await firstCommitted;
+          },
+        },
+      );
+      await firstStarted;
+      const second = freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
+        `{"providers":{"second":{}}}\n`,
+        join(tempAgentDir, "models.json.backup-cache-optimizer-lock-second"),
+        () => null,
+        { expectedCurrentHash: hash },
+      );
+      releaseFirst();
+      assert.deepEqual((await Promise.allSettled([first, second])).map((result) => result.status), ["fulfilled", "rejected"]);
+      assert.equal(await readFile(modelsPath, "utf8"), `{"providers":{"first":{}}}\n`);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
+  test("receipt atomic write rejects a replacement at the final rename boundary", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-receipt-final-race-test-"));
+    const receiptPath = join(tempDir, "receipt.json");
+    const originalText = '{"providers":{"proxy":{"models":[{"id":"deepseek-race","compat":{}}]}}}';
+    const modifiedText = '{"providers":{"proxy":{"models":[{"id":"deepseek-race","compat":{"sendSessionAffinityHeaders":true}}]}}}';
+    const originalReceipt = internals.createModelsJsonFixReceipt(
+      originalText,
+      modifiedText,
+      "proxy",
+      "deepseek-race",
+      "model",
+      { sendSessionAffinityHeaders: true },
+      true,
+      "models.json.backup-cache-optimizer-original",
+      10,
+    );
+    const replacementReceipt = internals.createModelsJsonFixReceipt(
+      originalText,
+      modifiedText,
+      "proxy",
+      "deepseek-race",
+      "model",
+      { sendSessionAffinityHeaders: true },
+      true,
+      "models.json.backup-cache-optimizer-replacement",
+      20,
+    );
+    assert.ok(originalReceipt && replacementReceipt);
+    try {
+      await internals.writeModelsJsonFixReceipt(originalReceipt, receiptPath);
+      const snapshot = await internals.readModelsJsonFixReceiptSnapshot(receiptPath);
+      assert.ok(snapshot);
+      await assert.rejects(
+        internals.writeModelsJsonFixReceipt(
+          { ...originalReceipt, status: "rolled_back", rolledBackAt: 30 },
+          receiptPath,
+          snapshot,
+          async () => {
+            await writeFile(receiptPath, JSON.stringify(replacementReceipt, null, 2) + "\n", "utf8");
+          },
+        ),
+        /fix receipt changed/,
+      );
+      assert.equal((await internals.readModelsJsonFixReceipt(receiptPath))?.transactionId, replacementReceipt.transactionId);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("receipt replacement after preview aborts rollback without changing models.json", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-receipt-cas-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const modelsPath = join(tempAgentDir, "models.json");
+    const receiptPath = join(tempAgentDir, "pi-cache-optimizer-fix-receipt.json");
+    const original = `{"providers":{"proxy":{"models":[{"id":"deepseek-v4","compat":{"sendSessionAffinityHeaders":false}}]}}}\n`;
+    const fixed = original.replace("false", "true");
+
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      await writeFile(modelsPath, fixed, { encoding: "utf8", mode: 0o600 });
+      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
+        interopDefault: false,
+        moduleCache: false,
+      });
+      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const receiptA = freshModule.__internals_for_tests.createModelsJsonFixReceipt(
+        original,
+        fixed,
+        "proxy",
+        "deepseek-v4",
+        "model",
+        { sendSessionAffinityHeaders: true },
+        true,
+        join(tempAgentDir, "models.json.backup-cache-optimizer-a"),
+        1,
+      );
+      assert.ok(receiptA);
+      await writeFile(join(tempAgentDir, receiptA.backupFile), original, "utf8");
+      await freshModule.__internals_for_tests.writeModelsJsonFixReceipt(receiptA, receiptPath);
+      const snapshot = await freshModule.__internals_for_tests.readModelsJsonFixReceiptSnapshot(receiptPath);
+      assert.ok(snapshot);
+      const plan = await freshModule.__internals_for_tests.prepareModelsJsonRollback(snapshot, modelsPath);
+      assert.equal("error" in plan, false);
+      if ("error" in plan) return;
+
+      const receiptB = { ...receiptA, transactionId: "replacement", modelId: "other-model" };
+      await freshModule.__internals_for_tests.writeModelsJsonFixReceipt(receiptB, receiptPath);
+      await assert.rejects(
+        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
+          plan.modifiedText,
+          plan.rollbackBackupPath,
+          (writtenText: string) => freshModule.__internals_for_tests.validateModelsJsonRollback(
+            writtenText,
+            plan.receipt,
+            plan.expectedResultHash,
+          ),
+          {
+            expectedCurrentHash: plan.currentHash,
+            expectedCurrentMode: plan.fileMode,
+            receiptGuard: snapshot,
+            purpose: "rollback",
+          },
+        ),
+        /fix receipt changed since the rollback preview/,
+      );
+      assert.equal(await readFile(modelsPath, "utf8"), fixed);
+      assert.equal((await readdir(tempAgentDir)).some((name) => name.startsWith("models.json.backup-cache-optimizer-rollback-")), false);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
+  test("direct rollback command restores an unchanged fix and marks the receipt", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-command-rollback-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousRetention = process.env.PI_CACHE_RETENTION;
+    const modelsPath = join(tempAgentDir, "models.json");
+    const original = `{
+  "providers": {
+    "proxy": {
+      // Keep credentials and comments through both transactions.
+      "apiKey": "env:SECRET",
+      "baseUrl": "https://proxy.example/v1",
+      "models": [{ "id": "deepseek-v4", "name": "DeepSeek V4" }]
+    }
+  }
+}`;
+
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      await writeFile(modelsPath, original, "utf8");
+      await chmod(modelsPath, 0o640);
+
+      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
+        interopDefault: false,
+        moduleCache: false,
+      });
+      const freshModule = await jiti.import<typeof import("../index.ts")>(
+        join(process.cwd(), "index.ts"),
+      );
+      const commands = new Map<string, { handler: (args: string, context: any) => Promise<void> }>();
+      freshModule.default({
+        on() {},
+        registerCommand(name: string, command: { handler: (args: string, context: any) => Promise<void> }) {
+          commands.set(name, command);
+        },
+      } as any);
+      const command = commands.get("cache-optimizer");
+      assert.ok(command);
+
+      const model = {
+        provider: "proxy",
+        id: "deepseek-v4",
+        name: "DeepSeek V4",
+        api: "openai-completions",
+        baseUrl: "https://proxy.example/v1",
+        compat: {},
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128_000,
+        maxTokens: 8192,
+      };
+      const confirmations: string[] = [];
+      const notifications: string[] = [];
+      const context = {
+        model,
+        hasUI: true,
+        sessionManager: { getSessionId: () => "rollback-command-test-session" },
+        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        ui: {
+          confirm: async (title: string) => {
+            confirmations.push(title);
+            return true;
+          },
+          notify: (message: string) => notifications.push(message),
+          setStatus() {},
+          select: async () => undefined,
+        },
+      };
+
+      await command.handler("fix", context);
+      const fixed = await readFile(modelsPath, "utf8");
+      assert.notEqual(fixed, original);
+      assert.equal((await stat(modelsPath)).mode & 0o7777, 0o640);
+      const receiptPath = join(tempAgentDir, freshModule.__internals_for_tests.FIX_RECEIPT_FILE_NAME);
+      const receiptBeforeRollback = freshModule.__internals_for_tests.parseModelsJsonFixReceipt(
+        JSON.parse(await readFile(receiptPath, "utf8")),
+      );
+      assert.ok(receiptBeforeRollback);
+      assert.equal(receiptBeforeRollback.status, undefined);
+      assert.equal(receiptBeforeRollback.afterHash, freshModule.__internals_for_tests.hashText(fixed));
+      assert.equal((await stat(receiptPath)).mode & 0o7777, 0o600);
+
+      await command.handler("rollback", { ...context, hasUI: false });
+      assert.equal(await readFile(modelsPath, "utf8"), fixed);
+      assert.ok(notifications.some((message) => message.includes(receiptBeforeRollback.backupFile)));
+      assert.equal(confirmations.filter((title) => /Rollback/.test(title)).length, 0);
+
+      await command.handler("rollback", context);
+      assert.equal(confirmations.filter((title) => /Rollback/.test(title)).length, 1);
+      assert.equal(await readFile(modelsPath, "utf8"), original);
+      assert.equal((await stat(modelsPath)).mode & 0o7777, 0o640);
+      assert.ok(notifications.some((message) => message.includes("Rollback completed")));
+      assert.ok(notifications.some((message) => /run \/reload/i.test(message)));
+      const receiptAfterRollback = freshModule.__internals_for_tests.parseModelsJsonFixReceipt(
+        JSON.parse(await readFile(receiptPath, "utf8")),
+      );
+      assert.equal(receiptAfterRollback?.status, "rolled_back");
+      assert.equal(receiptAfterRollback?.rolledBackAt !== undefined, true);
+      const rollbackBackups = (await readdir(tempAgentDir)).filter((name) =>
+        name.startsWith("models.json.backup-cache-optimizer-rollback-"),
+      );
+      assert.equal(rollbackBackups.length, 1);
+      assert.equal(await readFile(join(tempAgentDir, rollbackBackups[0]), "utf8"), fixed);
+      assert.equal((await stat(join(tempAgentDir, rollbackBackups[0]))).mode & 0o7777, 0o640);
+
+      const notificationCount = notifications.length;
+      await command.handler("rollback", context);
+      assert.equal(notifications.length, notificationCount + 1);
+      assert.match(notifications.at(-1) ?? "", /No unapplied \/cache-optimizer fix receipt was found/);
+      assert.equal(confirmations.filter((title) => /Rollback/.test(title)).length, 1);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      else process.env.PI_CACHE_RETENTION = previousRetention;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
+  test("restores models.json atomically when receipt commit fails", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-receipt-failure-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const modelsPath = join(tempAgentDir, "models.json");
+    const backupPath = join(tempAgentDir, "models.json.backup-cache-optimizer-receipt-failure");
+    const original = '{\n  "providers": { "proxy": { "models": [{ "id": "model" }] } }\n}\n';
+
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      await writeFile(modelsPath, original, "utf8");
+      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
+        interopDefault: false,
+        moduleCache: false,
+      });
+      const freshModule = await jiti.import<typeof import("../index.ts")>(
+        join(process.cwd(), "index.ts"),
+      );
+      const modified = original.replace('"models"', '"compat": { "sendSessionAffinityHeaders": true }, "models"');
+      await assert.rejects(
+        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
+          modified,
+          backupPath,
+          () => null,
+          {
+            expectedCurrentHash: freshModule.__internals_for_tests.hashText(original),
+            onCommitted: async () => {
+              throw new Error("simulated receipt write failure");
+            },
+          },
+        ),
+        /simulated receipt write failure/,
+      );
+      assert.equal(await readFile(modelsPath, "utf8"), original);
+      assert.equal(await readFile(backupPath, "utf8"), original);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
