@@ -33,6 +33,10 @@ Rules:
 - Recent samples are in-memory only and contain only numeric counters/booleans.
 - Runtime enable/disable is process-local and should not write settings files.
 
+### Deterministic tool-order state
+
+The `PI_CACHE_OPTIMIZER_TOOL_ORDER` experiment has no persistent or mutable global state. Its pure helper validates an allowlisted provider payload, computes a stable exact-name/index order, and returns either the original payload or a replacement that shallow-clones only the changed path. Tool objects and unrelated request fields retain identity. Any top-level tool `cache_control` marker, including one emitted by OpenAI-compatible Anthropic cache formatting, causes a no-op; Anthropic `defer_loading` grouping also causes a no-op.
+
 ### Persisted stats state
 
 Stats use a v7 shard store under `~/.pi/agent/pi-cache-optimizer-stats.d/`. Each loaded extension instance owns one UUID-named file in `shards/` and never edits another instance's shard.
@@ -50,7 +54,7 @@ Rules:
 
 ### User configuration state
 
-`~/.pi/agent/models.json` is not mutated during normal operation. The only allowed writer is `/cache-optimizer fix`, and only after explicit interactive confirmation.
+`~/.pi/agent/models.json` is not mutated during normal hook operation. The only allowed command writers are `/cache-optimizer fix` and `/cache-optimizer rollback`, and both require explicit interactive confirmation.
 
 Normal operation may read compat-only configuration from this file to resolve effective diagnostics/request behavior. Resolution is exact-provider/exact-model and follows `provider.compat → matching models[].compat → runtime model.compat → modelOverrides[modelId].compat`; malformed or unreadable configuration falls back to runtime model compat without blocking hooks. Raw credentials and unrelated configuration are never displayed, logged, or persisted elsewhere.
 
@@ -60,6 +64,9 @@ Rules for `/cache-optimizer fix`:
 - Use a comment-preserving JSONC surgical edit.
 - Insert/repair only safe `compat` keys or a missing `compat` object under an existing provider/model.
 - Do not create/delete providers, models, API keys, credentials, or router slugs.
+- Never invent `thinkingFormat: "deepseek"`; an evidence-driven protocol repair must be model-scoped and require the same preview/confirmation flow.
+- On successful interactive writes, atomically record only a versioned privacy-safe receipt containing transaction/model identity, placement, changed scalar before/after values, file hashes, backup filename, and timestamps.
+- `/cache-optimizer rollback` requires UI confirmation. An unchanged file may be restored exactly after backup-hash verification; a changed file may only receive guarded surgical restoration of receipt-owned scalar keys. Fix/rollback transactions serialize across extension instances and bind the receipt identity from preview through commit.
 
 ---
 
@@ -68,6 +75,8 @@ Rules for `/cache-optimizer fix`:
 - Adapter selection derives from model id/name tokens only.
 - Stats bucket keys derive from opaque session hash + exact provider/model key; shard filenames derive from random instance UUIDs.
 - Compat marker derives from safe fix suggestions for the effective model after exact models.json/runtime compat precedence is applied.
+- DeepSeek reasoning diagnostics derive from explicit effective `thinkingFormat: "deepseek"` only; model family, provider, URL, and `supportsReasoningEffort` do not prove the wire protocol.
+- Reasoning-protocol rejection evidence is a process-local model-scoped category only. It contains no raw error text and is never persisted.
 - Routing-provider live state may derive an effective upstream model for pre-message UX, but final stats derive from assistant message metadata.
 
 ---
@@ -75,9 +84,12 @@ Rules for `/cache-optimizer fix`:
 ## Common Mistakes
 
 - Persisting raw session ids.
+- Inferring `thinkingFormat: "deepseek"` from a DeepSeek model name or automatically probing a provider.
+- Persisting complete provider errors or allowing a response hook to auto-edit/rollback `models.json`.
 - Aggregating normal stats into provider-family buckets instead of session-scoped provider/model buckets.
 - Treating local footer reset as upstream provider cache invalidation.
 - Reintroducing the obsolete shared v6 file or legacy `_nosession` migration buckets into runtime behavior.
 - Deleting a current-day closed child shard during shutdown or maintenance.
 - Using PID/PPID to decide stats ownership or parent-child attribution; they are diagnostics/cleanup hints only.
 - Storing full prompts in global singleton compatibility shims.
+- Sorting provider payloads in place, cloning unrelated SDK objects, moving any tool cache marker, or crossing Anthropic deferred-tool groups.

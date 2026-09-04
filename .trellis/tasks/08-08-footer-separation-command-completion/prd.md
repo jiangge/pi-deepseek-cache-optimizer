@@ -52,7 +52,7 @@ Make Pi Cache Optimizer's footer status visually distinct when other extensions 
 * [x] Direct and menu `/fix` paths preserve modes such as `0600` and `0644`; forced post-write failure atomically restores both original bytes and mode.
 * [x] Two backup names generated in the same millisecond are distinct and existing backups are never overwritten.
 * [x] A body-only assistant error `400 Unsupported parameter: prompt_cache_retention` makes the next request omit that field.
-* [x] Standard `npm run typecheck` uses the installed Pi 0.84.2 declarations and passes without `types/pi-coding-agent.d.ts` or Node module redeclarations.
+* [x] Standard `npm run typecheck` uses the installed Pi 0.84.3 declarations and passes without `types/pi-coding-agent.d.ts` or Node module redeclarations.
 * [x] Permanent tests cover migrations, `_nosession` removal, serialized writes, shutdown flush, routing/cache-hints, TTL ordering, cache key preservation, and direct-provider identity consolidation.
 * [x] `peerDependencies` requires Pi 0.82+ and interactive menu actions reuse the direct command handler.
 * [x] Parent, child, parallel, and independently running Pi instances write distinct atomic v7 shard files and never overwrite one another.

@@ -9,7 +9,7 @@
 
 用于提升 Pi 中 provider 侧 KV Cache / Prompt Cache 命中率的扩展：把稳定 prompt 内容前置，给 OpenAI-compatible 请求补保守的 `prompt_cache_key`，提示代理渠道常见缓存路由兼容问题，并在底部显示只读缓存统计。
 
-> 本包已从 `pi-deepseek-cache-optimizer` 改名。已有底部统计会自动迁移。正常运行时扩展不会触碰 Pi 的 `models.json`（默认 `~/.pi/agent/models.json`；自定义 agent 目录使用 `PI_CODING_AGENT_DIR`）；只有 `/cache-optimizer fix` 会在展示交互式预览、风险提示并得到明确确认后写入，且会先创建带时间戳的自动备份。
+> 本包已从 `pi-deepseek-cache-optimizer` 改名。已有底部统计会自动迁移。正常 hook 运行时扩展不会触碰 Pi 的 `models.json`（默认 `~/.pi/agent/models.json`；自定义 agent 目录使用 `PI_CODING_AGENT_DIR`）；只有 `/cache-optimizer fix` 和 `/cache-optimizer rollback` 可在展示交互式预览、风险提示并得到明确确认后写入，且都会先创建带时间戳的自动备份。
 
 ## 目录
 
@@ -17,10 +17,12 @@
 - [安装](#安装)
 - [命令](#命令)
 - [持久 Opt-out](#持久-opt-out)
+- [Opt-in 确定性工具排序](#opt-in-确定性工具排序)
 - [Footer 缓存统计模式](#footer-缓存统计模式)
 - [OpenAI-compatible 代理配置](#openai-compatible-代理配置)
 - [Adaptive thinking 模型](#adaptive-thinking-模型)
 - [使用 `/cache-optimizer fix` 自动修复](#使用-cache-optimizer-fix-自动修复)
+- [DeepSeek 协议安全与回滚](#deepseek-协议安全与回滚)
 - [Footer 统计](#footer-统计)
 - [Router / Virtual-channel 扩展作者指南](#router--virtual-channel-扩展作者指南)
 - [卸载](#卸载)
@@ -38,6 +40,7 @@
 - 使用每个 extension instance 独占的原子 shard 保存缓存统计，避免父会话、子 Pi agent 和并行 Pi 进程互相覆盖。
 - Footer 默认显示当前 conversation session 的 provider/model 统计；`total` 可聚合同一精确 provider/model 的所有有效本地 shard。
 - 通过版本化全局协议（`Symbol.for("pi.routing.registry.v1")` 与 `Symbol.for("pi.cache.hints.v1")`）支持可选的 router extension 集成，而不导入任何 router 包。
+- 提供默认关闭的确定性排序，用于已验证的 Pi 内置工具 payload。
 
 缓存是 provider 侧的 best-effort 行为。第三方代理和 router extension 仍可能隐藏缓存 usage、拒绝不支持的参数，或把请求路由到多个上游。
 
@@ -57,7 +60,7 @@ pi remove npm:pi-deepseek-cache-optimizer && pi install npm:pi-cache-optimizer
 
 Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安装的 Pi package（包括本扩展），请运行 `pi update --extensions`（只更新 packages）或 `pi update --all`（Pi 与 packages 一起更新）。
 
-本扩展要求 Pi 0.82+，并已使用 Pi 0.84.2 验证。TypeScript 校验直接使用官方 Pi package 类型，同时只使用这些版本共有的 extension hooks、`getAgentDir()` 和 prompt options；不依赖 Pi 0.83+ 专有 API（例如 `ctx.scopedModels` 或 bundled TypeBox 1.3 aliases）。
+本扩展要求 Pi 0.82+，并已使用 Pi 0.84.4 验证。TypeScript 校验直接使用官方 Pi package 类型，同时只使用这些版本共有的 extension hooks、`getAgentDir()` 和 prompt options；不依赖 Pi 0.83+ 专有 API（例如 `ctx.scopedModels` 或 bundled TypeBox 1.3 aliases）。
 
 ## 命令
 
@@ -73,7 +76,8 @@ Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安
 | `/cache-optimizer stats contributors` | 显示当前精确 provider/model 的当前/其他贡献 session，不暴露 session id。 |
 | `/cache-optimizer reset` | 重置当前 provider/model 的本地 footer 统计；不会修改上游 provider 缓存。 |
 | `/cache-optimizer config footer-mode total\|session\|process` | 持久设置 footer 统计模式；持久命令配置优先于环境变量。 |
-| `/cache-optimizer fix` | 为当前模型自动修复安全的 compat 问题（adaptive thinking、DeepSeek reasoning、OpenAI proxy session affinity）。展示预览 + 风险提示，需要用户确认。**仅在用户明确批准后才修改 `models.json`。** |
+| `/cache-optimizer fix` | 为当前模型自动修复安全的 compat 问题。展示预览 + 风险提示，需要用户确认。**仅在用户明确批准后才修改 `models.json`。** |
+| `/cache-optimizer rollback` | 查看最近一次匹配的已确认修复；经 UI 确认后安全撤销，不覆盖无关的 `models.json` 用户修改。 |
 
 `/cache-optimizer` 使用 Pi 原生 Tab 补全：输入 `/cache-optimizer <Tab>` 查看支持的子命令，输入 `/cache-optimizer stats <Tab>` 补全 `all` 或 `contributors`，输入 `/cache-optimizer c<Tab>` 补全 `config`，输入 `/cache-optimizer config <Tab>` 补全 `footer-mode`，输入 `/cache-optimizer config footer-mode <Tab>` 补全 `total`、`session` 或 `process`。建议会按当前前缀过滤；无效前缀返回空结果，由 Pi 正常回退处理。
 
@@ -87,6 +91,22 @@ Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安
 | `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | 保留 Pi 原始 verbose skill XML。 |
 | `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` | 关闭 OpenAI-compatible `prompt_cache_key` fallback。推荐使用这个显式 opt-out。 |
 | `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` | 通过旧的反向开关关闭同一个 fallback。取值 `0`、`false`、`no`、`off` 时关闭。 |
+
+## Opt-in 确定性工具排序
+
+`PI_CACHE_OPTIMIZER_TOOL_ORDER=1` 会对 Pi 内置 OpenAI Completions、Anthropic、Google 与 Bedrock payload 中已验证的工具定义进行确定性排序。Truthy 取值为（不区分大小写）`1`、`true`、`yes` 或 `on`。该能力默认关闭、仅在当前进程生效，并会被 `/cache-optimizer disable` 抑制。
+
+工具按精确名称排序，并用原始 index 作为稳定的同名 tie-breaker。排序只对发生变化的已验证对象/数组路径做浅 clone。工具对象和无关请求字段保持原引用，包括 Google/Vertex 的 `AbortSignal`；工具 schema、tool choice、routing 字段和调用方输入都保持不变。
+
+出于安全考虑，只要工具存在顶层 `cache_control` marker，或 Anthropic payload 包含 `defer_loading` 分组，payload 就保持不变。未知 / 自定义 API、畸形工具、缺少名称或不支持的 shape 同样保持不变。纯 helper 可识别 OpenAI Responses fixture，但 request hook 保留既有 Responses/Codex bypass，不会重排这些请求。
+
+回滚很简单：删除变量或设为非 truthy 值，然后运行 `/reload`。如需使用本地 fixture 验证转换、且不连接 provider，可运行：
+
+```bash
+bun .trellis/tasks/09-03-context-epoch-tool-ordering/verify.ts
+```
+
+该 verifier 只报告数字形式的工具排序变化，并确认带 cache marker 的 payload 不会变化。由于它不会连接 provider，provider cache usage 会明确报告为 unavailable，也不会虚构 cache hit。
 
 ## Footer 缓存统计模式
 
@@ -142,7 +162,8 @@ Pi 0.84.1 还修复了内置 Fireworks 渠道对拒绝 `prompt_cache_retention` 
 - `supportsLongCacheRetention: true` 是可选项。只有 endpoint 明确支持 OpenAI long prompt cache retention 时才添加。
 - 如果出现 `400 Unsupported parameter: prompt_cache_retention`，请为该渠道移除 / 避免 `supportsLongCacheRetention`；如支持，可保留 `sendSessionAffinityHeaders`。扩展会从响应头或最终 assistant error message 中识别这条明确错误，并在当前进程的后续请求中移除该参数。
 - 使用 `/cache-optimizer compat` 或 `/cache-optimizer doctor` 查看当前模型的具体建议。
-- 对 DeepSeek 模型，Pi Mono 指南期望在支持时同时设置 `compat.requiresReasoningContentOnAssistantMessages: true` 和 `compat.thinkingFormat: "deepseek"`，再配合缓存 / session-affinity 相关 compat。
+- DeepSeek 模型名只用于选择 `DS cache` adapter，不能证明 reasoning wire protocol。缺少或使用非 DeepSeek format 时仍保留通用缓存 / 路由建议；只有 effective `compat.thinkingFormat: "deepseek"` 被明确配置时，才显示 DeepSeek replay 建议，且不会把 `thinkingFormat` 列为缺失修复项。
+- 不要因为模型 id 含有 `deepseek` 就添加 `thinkingFormat: "deepseek"`；catalog 中也存在 `openai`、`qwen`、`openrouter`、`together` 或没有显式 format 的情况。
 - 本扩展的 `doctor` 和 `compat` 命令只给建议，不会修改 `models.json`。
 
 ## Anthropic 缓存 TTL 兼容
@@ -223,7 +244,7 @@ Pi 0.80.9+ 已在内置 Kimi Coding、Moonshot AI / 中国区、OpenRouter 和 V
 **v2.6.0+** 新增 `fix` 子命令，可自动修复安全的 compat 问题：
 
 - Adaptive thinking（`forceAdaptiveThinking: true`；Kimi Coding K3 / `kimi-for-coding` 还包括 `allowEmptySignature: true`）
-- DeepSeek Pi Mono reasoning compat（`thinkingFormat: "deepseek"`、`requiresReasoningContentOnAssistantMessages: true`）
+- DeepSeek Pi Mono replay compat（仅当已明确配置 `thinkingFormat: "deepseek"` 时使用 `requiresReasoningContentOnAssistantMessages: true`；`/fix` 不会自行推断该 format）
 - OpenAI-compatible proxy session affinity（`openai-completions` 使用 `sendSessionAffinityHeaders: true`）。Pi 0.80.7+ 使用 `sessionAffinityFormat` 控制 `openai-responses` header 形式并自动检测默认值；本扩展不再写入已移除的 `sendSessionIdHeader`。
 
 **范围：** 仅当前 active model。其他渠道需切换模型后再次运行 `fix`。
@@ -238,11 +259,17 @@ Pi 0.80.9+ 已在内置 Kimi Coding、Moonshot AI / 中国区、OpenRouter 和 V
 6. 完全保留 `models.json` 原有访问权限，不主动收紧或放宽（例如 `0600` 保持 `0600`，`0644` 保持 `0644`）
 7. 备份名唯一且不会覆盖已有备份；如果 JSONC 扫描器无法置信定位目标，则回退到手动修改指引
 
-已有的 `modelOverrides[modelId]` 具有 Pi 的最高优先级，因此 `fix` 会直接修复该 entry。对于没有自定义 `models[]` entry 的内置模型或 API-login 模型，`fix` 会创建仅含 compat 的 `modelOverrides` entry，而不会凭空添加自定义模型定义。自检会验证三层合并后的有效 compat，因此被更高层 override 遮蔽的低层修改会被拒绝。
+已有的 `modelOverrides[modelId]` 具有 Pi 的最高优先级，因此 `fix` 会直接修复该 entry。对于没有自定义 `models[]` entry 的内置模型或 API-login 模型，`fix` 会创建仅含 compat 的 `modelOverrides` entry，而不会凭空添加自定义模型定义。运行时观察到的 provider 失败也始终写入这一最高优先级 model override，避免 extension-provided runtime compat 遮挡修复。自检会验证完整的 provider → custom model → runtime model → modelOverride 结果；无效的低层写入会被拒绝。
 
 **非交互模式：** 拒绝写入，显示手动编辑指引。
 
 **运行：** 当 active model 检测到 compat 问题时执行 `/cache-optimizer fix`。compat 已完整时，命令显示"无需修复"。
+
+## `/cache-optimizer rollback`
+
+Rollback 可通过补全、直接命令和交互菜单使用，并始终需要 UI 确认。命令会选择匹配当前 provider/model 的最新未回滚 receipt，验证备份与文件 hash，创建新的保留访问权限的 rollback backup，并使用临时文件 + 原子替换。Fix 与 rollback 在多个 extension instance 间串行执行；rollback 还会把预览时的 receipt transaction id/hash 绑定到提交阶段，若另一事务替换 receipt 就安全拒绝。没有交互式 UI 时只提供手动恢复指引，不会写入文件。
+
+如果 `models.json` 自 fix 后没有变化，rollback 可以恢复完整的 pre-fix JSONC；如果文件发生变化，则绝不会盲目替换整个文件，只会在 receipt-owned scalar key 仍等于记录的 post-fix 值时撤销该 key，并保留之后的用户修改。如果 receipt-owned key 已变化、目标被删除/移动，或 fix 新建了目标项，命令会安全拒绝并指向记录的 backup 供手动检查。成功后 receipt 会标记为已回滚，并需要 `/reload` 或重启。
 
 ### 没有 `models.json` provider entry 的渠道
 
@@ -281,6 +308,21 @@ Pi Cache Optimizer 按 Pi 的优先级解析有效 compat（`provider.compat` �
   }
 }
 ```
+
+## DeepSeek 协议安全与回滚
+
+模型家族名称与 reasoning wire protocol 是两件事。使用 OpenAI-compatible endpoint 的 DeepSeek 名称模型，可能使用标准顶层 `reasoning_effort`、DeepSeek 风格 `thinking`，或其它 provider-specific format。单独的 `supportsReasoningEffort: true` 不能证明协议。为此，`/cache-optimizer fix` 永远不会凭模型名推断或添加 `thinkingFormat: "deepseek"`；只有 endpoint 文档或 provider 的明确证据支持时，才应配置显式 format。
+
+面向新手的安全流程是分阶段的：
+
+1. 先运行 `/cache-optimizer fix`，只处理协议无关的缓存 / 路由修复，例如 session affinity；命令会展示具体位置并要求确认。
+2. 发起一次普通请求。如果 OpenAI-compatible 的 DeepSeek-like 模型明确拒绝 `thinking` 并要求使用 `reasoning_effort`，扩展只在当前进程保留 model-scoped 分类，不会持久化或显示完整错误，不会发送隐藏探测请求，也不会在 response hook 中自动修改配置。
+3. 再次运行 `/cache-optimizer fix`，查看基于证据的 model-level 协议修复；该修复写入最高优先级的 `modelOverrides[modelId].compat`，并结合 runtime compat 自检，避免 extension-provided model 静默遮挡。不会仅凭共享 provider 或模型名字扩大修改范围，显式 `openai`、`qwen`、`openrouter`、`together` format 会被尊重。
+4. 如果最近一次已确认修复导致问题，运行 `/cache-optimizer rollback`；回滚始终需要 UI 确认。
+
+每次成功的交互式 fix 都会以原子方式写入版本化 receipt：`pi-cache-optimizer-fix-receipt.json`。它只包含 transaction id、provider/model identity、placement、发生变化的 scalar compat key 及 before/after 值、文件 hash、备份文件名和时间戳/status。不会保存 API key、credential、prompt、payload、header、response body 或原始错误。
+
+Rollback 会创建新的、保留访问权限的备份并使用原子替换。如果 `models.json` 自 fix 后未变化，且 receipt 备份匹配 pre-fix hash，则可恢复完整 pre-fix 文件。如果文件发生变化，只会在 receipt-owned scalar key 仍等于记录的 post-fix 值时撤销该 key，并保留其它用户修改；否则安全拒绝并指向记录的备份供手动检查。验证后 receipt 会标记为已回滚，需要 `/reload` 或重启 Pi。
 
 ## Footer 统计
 

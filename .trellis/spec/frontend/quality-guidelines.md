@@ -46,6 +46,7 @@ python3 ./.trellis/scripts/task.py validate .trellis/tasks/<task>
 - Update `.trellis/spec/frontend/cache-adapter-footer-stats.md` when changing cache stats, prompt optimization, compat diagnostics, persistence, or routing-provider behavior.
 - Keep `README.md` and `README.zh-CN.md` in sync for user-visible features or commands.
 - Add/update permanent regression tests under `tests/` for runtime contracts. `npm test` must execute every `tests/*.test.ts` file. A task-level verifier may supplement them for one-off investigation or release evidence, but archived task files must not be the only coverage.
+- For request-ordering experiments, run `.trellis/tasks/<task>/verify.ts` with deterministic fixtures. The verifier may report numeric order/change metrics, but must never claim synthetic provider cache hits or print sensitive material.
 - Keep footer behavior truthful; never fake cache counters for transports that do not expose usage fields.
 - Prefer conservative fallback behavior over crashes in Pi hooks.
 - When extension-provider composition can drop lower-level compat, resolve exact models.json/runtime precedence before diagnosing or bridging request behavior; never silence a warning without ensuring the corresponding wire behavior is active.
@@ -56,7 +57,7 @@ python3 ./.trellis/scripts/task.py validate .trellis/tasks/<task>
 ## Forbidden Patterns
 
 - Logging or persisting API keys, prompts, payloads, headers, response bodies, raw session ids, or model outputs.
-- Writing `models.json` outside the explicit `/cache-optimizer fix` confirmation flow.
+- Writing `models.json` outside the explicit `/cache-optimizer fix` or `/cache-optimizer rollback` confirmation flows.
 - Changing the existing `models.json` access mode during fix/backup/rollback; preserve it exactly rather than enforcing a preferred mode.
 - In-place writes or rollbacks to stats/config/models files when atomic temp + rename is required.
 - Adapter selection by provider id, API type, base URL, or compat flags.

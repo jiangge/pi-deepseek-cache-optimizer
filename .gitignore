@@ -25,3 +25,5 @@ coverage/
 *.log
 *.tmp
 .DS_Store
+.ml-cache/
+.mainline/local.toml

@@ -208,7 +208,7 @@ describe("OpenAI-compatible request contracts", () => {
     }
   });
 
-  test("installed Pi registerProvider drops lower provider compat for extension-owned models", async () => {
+  test("installed Pi 0.84.4 registerProvider drops lower provider compat for extension-owned models", async () => {
     const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-extension-provider-model-test-"));
     try {
       const modelsPath = join(tempAgentDir, "models.json");
